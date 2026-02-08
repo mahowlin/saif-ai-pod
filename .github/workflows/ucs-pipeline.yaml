@@ -1,0 +1,312 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+#
+# This software is licensed to you under the terms of the Cisco Sample
+# Code License, Version 1.1 (the "License"). You may obtain a copy of the
+# License at
+#
+#                https://developer.cisco.com/docs/licenses
+#
+# All use of the material herein must be in accordance with the terms of
+# the License. All rights not expressly granted by the License are
+# reserved. Unless required by applicable law or agreed to separately in
+# writing, software distributed under the License is distributed on an "AS
+# IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied.
+
+name: 'UCS Pipeline'
+run-name: "UCS ${{ inputs.operation }} - ${{ inputs.server_target }}${{ inputs.request_id && format(' [rid={0}]', inputs.request_id) || '' }}"
+
+# Orchestrates UCS configuration and deployment with simplified operations:
+#
+# Operations:
+#   Plan       - Preview config changes (no changes made)
+#   Stage      - Create/update config in Intersight (not deployed to server)
+#   Activate   - Apply config AND deploy to server hardware
+#   Deactivate - Remove config from server (keeps config in Intersight)
+#   Delete     - Remove config from server AND Intersight
+#
+# This avoids the 30-minute hardcoded wait in Easy-IMM module by using isctl.
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: 'What do you want to do?'
+        required: true
+        type: choice
+        options:
+          - 'Plan - Preview config changes'
+          - 'Stage - Create/update config (not deployed)'
+          - 'Activate - Apply config to server'
+          - 'Deactivate - Remove from server (keeps config)'
+          - 'Delete - Remove from server AND Intersight'
+
+      server_target:
+        description: 'Server profile(s) to manage'
+        required: true
+        type: choice
+        options:
+          - saif-ai-pod-1
+          - saif-ai-pod-2
+          - saif-ai-pod-3
+          - saif-ai-pod-4
+          - ALL
+
+      domain_state:
+        description: 'Domain profile (FI pair) - rarely changed'
+        required: false
+        type: choice
+        default: 'Unchanged'
+        options:
+          - Unchanged
+          - Deployed
+          - Unassigned
+
+      skip_validation:
+        description: 'Skip validation step'
+        required: false
+        type: boolean
+        default: false
+
+      skip_test:
+        description: 'Skip test step'
+        required: false
+        type: boolean
+        default: false
+
+      confirm_delete:
+        description: 'Type profile name (or "ALL") to confirm Delete operation'
+        required: false
+        type: string
+        default: ''
+
+      request_id:
+        description: 'Orchestrator correlation ID (for run tracking)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  # Parse operation and map targets
+  setup:
+    name: 'Setup'
+    runs-on: [self-hosted, linux, saif-github-runner]
+    outputs:
+      operation: ${{ steps.parse.outputs.operation }}
+      profiles: ${{ steps.map.outputs.profiles }}
+      profile_list: ${{ steps.map.outputs.profile_list }}
+    steps:
+      - name: Parse operation
+        id: parse
+        run: |
+          # Extract operation keyword from descriptive choice
+          OPERATION=$(echo "${{ inputs.operation }}" | cut -d' ' -f1)
+          echo "operation=$OPERATION" >> $GITHUB_OUTPUT
+          echo "Operation: $OPERATION"
+
+      - name: Map server target to profiles
+        id: map
+        run: |
+          case "${{ inputs.server_target }}" in
+            "saif-ai-pod-1") PROFILES='["saif-ai-pod-1"]' ;;
+            "saif-ai-pod-2") PROFILES='["saif-ai-pod-2"]' ;;
+            "saif-ai-pod-3") PROFILES='["saif-ai-pod-3"]' ;;
+            "saif-ai-pod-4") PROFILES='["saif-ai-pod-4"]' ;;
+            "ALL") PROFILES='["saif-ai-pod-1","saif-ai-pod-2","saif-ai-pod-3","saif-ai-pod-4"]' ;;
+          esac
+          echo "profiles=$PROFILES" >> $GITHUB_OUTPUT
+          echo "profile_list=$(echo $PROFILES | tr -d '[]"' | tr ',' ' ')" >> $GITHUB_OUTPUT
+
+  # Safety check for Delete operations
+  delete-guard:
+    name: 'Delete Guard'
+    needs: setup
+    if: needs.setup.outputs.operation == 'Delete'
+    runs-on: [self-hosted, linux, saif-github-runner]
+    steps:
+      - name: Verify Delete Confirmation
+        run: |
+          echo "## Delete Operation Requested" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**WARNING:** This will permanently remove configuration from Intersight." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          CONFIRMATION="${{ inputs.confirm_delete }}"
+          TARGET="${{ inputs.server_target }}"
+
+          if [ "$TARGET" == "ALL" ]; then
+            REQUIRED="ALL"
+          else
+            REQUIRED="$TARGET"
+          fi
+
+          if [ "$CONFIRMATION" != "$REQUIRED" ]; then
+            echo "**Delete blocked:** Confirmation required" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "To confirm, set \`confirm_delete\` to: \`$REQUIRED\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Provided: \`$CONFIRMATION\`" >> $GITHUB_STEP_SUMMARY
+            echo "::error::Delete requires confirmation. Set confirm_delete to '$REQUIRED'"
+            exit 1
+          fi
+
+          echo "**Delete confirmed:** $CONFIRMATION" >> $GITHUB_STEP_SUMMARY
+
+  validate:
+    name: 'Validate'
+    needs: [setup, delete-guard]
+    if: always() && inputs.skip_validation != true && (needs.delete-guard.result == 'success' || needs.delete-guard.result == 'skipped')
+    runs-on: [self-hosted, linux, saif-github-runner]
+    container:
+      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+    env:
+      INTERSIGHT_API_KEY_ID: ${{ secrets.INTERSIGHT_API_KEY_ID }}
+      INTERSIGHT_SECRET_KEY: ${{ secrets.INTERSIGHT_SECRET_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Intersight Credentials
+        run: |
+          echo "## UCS Pipeline Validation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Operation:** ${{ inputs.operation }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Target:** ${{ inputs.server_target }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ -z "$INTERSIGHT_API_KEY_ID" ]; then
+            echo "INTERSIGHT_API_KEY_ID secret not set" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+          if [ -z "$INTERSIGHT_SECRET_KEY" ]; then
+            echo "INTERSIGHT_SECRET_KEY secret not set" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+          if isctl get iam account --top 1 -o json > /dev/null 2>&1; then
+            ACCOUNT=$(isctl get iam account --top 1 -o json | jq -r '.[0].Name // "unknown"')
+            echo "Connected to Intersight account: $ACCOUNT" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "Cannot connect to Intersight API" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+      - name: Validate Profiles Exist (for Deactivate only)
+        if: needs.setup.outputs.operation == 'Deactivate'
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Profile Check" >> $GITHUB_STEP_SUMMARY
+
+          PROFILES="${{ needs.setup.outputs.profile_list }}"
+          FAILED=0
+
+          for PROFILE in $PROFILES; do
+            MOID=$(isctl get server profile --filter "Name eq '$PROFILE'" -o json | jq -r '.[0].Moid // empty')
+            if [ -n "$MOID" ] && [ "$MOID" != "null" ]; then
+              STATE=$(isctl get server profile --filter "Name eq '$PROFILE'" -o json | jq -r '.[0].ConfigContext.ConfigState // "unknown"')
+              echo "- $PROFILE: exists (state: $STATE)" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- $PROFILE: NOT FOUND" >> $GITHUB_STEP_SUMMARY
+              FAILED=1
+            fi
+          done
+
+          if [ $FAILED -eq 1 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Some profiles not found. Cannot deactivate profiles that don't exist." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+  execute:
+    name: 'Execute'
+    needs: [setup, delete-guard, validate]
+    if: always() && (needs.validate.result == 'success' || needs.validate.result == 'skipped') && (needs.delete-guard.result == 'success' || needs.delete-guard.result == 'skipped')
+    uses: ./.github/workflows/ucs-deploy.yaml
+    with:
+      operation: ${{ needs.setup.outputs.operation }}
+      server_target: ${{ inputs.server_target }}
+      domain_state: ${{ inputs.domain_state }}
+    secrets: inherit
+
+  test:
+    name: 'Test'
+    needs: [setup, execute]
+    if: always() && needs.execute.result == 'success' && (needs.setup.outputs.operation == 'Activate' || needs.setup.outputs.operation == 'Stage') && inputs.skip_test != true
+    runs-on: [self-hosted, linux, saif-github-runner]
+    container:
+      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+    env:
+      INTERSIGHT_API_KEY_ID: ${{ secrets.INTERSIGHT_API_KEY_ID }}
+      INTERSIGHT_SECRET_KEY: ${{ secrets.INTERSIGHT_SECRET_KEY }}
+    steps:
+      - name: Checkout (fresh)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Pull latest changes
+        run: |
+          git pull origin ${{ github.ref_name }} || true
+
+      - name: Verify ucs-state.yaml
+        run: |
+          echo "## UCS Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ ! -f "ucs-state.yaml" ]; then
+            echo "ucs-state.yaml not found" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+      - name: Verify Profile States
+        run: |
+          echo "### Profile States" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          PROFILES="${{ needs.setup.outputs.profile_list }}"
+          OPERATION="${{ needs.setup.outputs.operation }}"
+
+          for PROFILE in $PROFILES; do
+            API_STATE=$(isctl get server profile --filter "Name eq '$PROFILE'" -o json | jq -r '.[0].ConfigContext.ConfigState // "unknown"')
+
+            if [ "$OPERATION" == "Activate" ]; then
+              if [ "$API_STATE" == "Associated" ]; then
+                echo "- $PROFILE: Associated (deployed)" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "- $PROFILE: $API_STATE (expected Associated)" >> $GITHUB_STEP_SUMMARY
+              fi
+            else
+              echo "- $PROFILE: $API_STATE" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+      - name: Verify MAC Addresses
+        if: needs.setup.outputs.operation == 'Activate'
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### MAC Addresses" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          PROFILES="${{ needs.setup.outputs.profile_list }}"
+
+          for PROFILE in $PROFILES; do
+            MAC_ETH0=$(yq -r ".chassis.*.servers.$PROFILE.mac_eth0 // \"null\"" ucs-state.yaml 2>/dev/null | head -1)
+            MAC_ETH1=$(yq -r ".chassis.*.servers.$PROFILE.mac_eth1 // \"null\"" ucs-state.yaml 2>/dev/null | head -1)
+
+            if [ "$MAC_ETH0" != "null" ] && [ -n "$MAC_ETH0" ]; then
+              echo "- $PROFILE eth0: $MAC_ETH0" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- $PROFILE eth0: not assigned" >> $GITHUB_STEP_SUMMARY
+            fi
+
+            if [ "$MAC_ETH1" != "null" ] && [ -n "$MAC_ETH1" ]; then
+              echo "- $PROFILE eth1: $MAC_ETH1" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- $PROFILE eth1: not assigned" >> $GITHUB_STEP_SUMMARY
+            fi
+          done

@@ -1,0 +1,136 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+#
+# This software is licensed to you under the terms of the Cisco Sample
+# Code License, Version 1.1 (the "License"). You may obtain a copy of the
+# License at
+#
+#                https://developer.cisco.com/docs/licenses
+#
+# All use of the material herein must be in accordance with the terms of
+# the License. All rights not expressly granted by the License are
+# reserved. Unless required by applicable law or agreed to separately in
+# writing, software distributed under the License is distributed on an "AS
+# IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied.
+
+#------------------------------------------------------------------------------
+# ImageSetConfiguration for Air-Gapped OpenShift Deployment
+#------------------------------------------------------------------------------
+# This configuration defines what images to mirror for offline installation.
+#
+# Usage:
+# 1. On a machine with internet access:
+#    oc mirror --config imageset-config.yaml file:///path/to/mirror
+#
+# 2. Transfer the /path/to/mirror directory to the air-gapped network
+#
+# 3. On the runner VM:
+#    oc mirror --from=/path/to/mirror docker://registry.example.com:5000
+#
+#------------------------------------------------------------------------------
+
+apiVersion: mirror.openshift.io/v2alpha1
+kind: ImageSetConfiguration
+mirror:
+  #----------------------------------------------------------------------------
+  # OpenShift Platform Images
+  #----------------------------------------------------------------------------
+  platform:
+    channels:
+      - name: stable-4.19
+        minVersion: 4.19.21
+        maxVersion: 4.19.21
+        type: ocp
+    graph: true  # Include update graph for cluster upgrades
+
+  #----------------------------------------------------------------------------
+  # Operator Catalog - Selected Operators Only
+  #----------------------------------------------------------------------------
+  operators:
+    # Red Hat Operators (from redhat-operator-index)
+    - catalog: registry.redhat.io/redhat/redhat-operator-index:v4.19
+      packages:
+        # Node Feature Discovery - Required for GPU detection
+        - name: nfd
+          channels:
+            - name: stable
+
+        # Local Storage Operator - Optional for local storage
+        - name: local-storage-operator
+          channels:
+            - name: stable
+
+        # OpenShift GitOps Operator - ArgoCD for GitOps workflows
+        - name: openshift-gitops-operator
+          channels:
+            - name: latest
+
+    # Certified Operators (from certified-operator-index)
+    - catalog: registry.redhat.io/redhat/certified-operator-index:v4.19
+      packages:
+        # CLIFE - Cilium Lifecycle Operator for Cilium Enterprise v1.18
+        - name: clife
+          defaultChannel: "1.18"
+          channels:
+            - name: "1.18"
+
+        # NVIDIA GPU Operator - For L40S GPU support
+        - name: gpu-operator-certified
+          channels:
+            - name: v25.10
+
+    # Tetragon Enterprise (separate OLM catalog from Isovalent)
+    - catalog: quay.io/isovalent/tetragon-operator-index:v0.0.1
+      packages:
+        - name: tetragon-operator
+          channels:
+            - name: v1.18
+
+  #----------------------------------------------------------------------------
+  # Additional Images - Cilium Enterprise v1.18
+  #----------------------------------------------------------------------------
+  # Note: These images require Isovalent registry access
+  # The certified-operators catalog will pull most Cilium images automatically.
+  # These additional images are for explicit mirroring if needed.
+  additionalImages:
+    # CLIFE Operator image - required for Day 1 manifest
+    # (isovalent-manifests/apps_v1_deployment_clife-controller-manager.yaml)
+    - name: quay.io/isovalent/clife@sha256:bf1953df529e58d15d1ae9ff1293e6eb22e6e38cc628620420b19cfc6e3e9b99
+
+  #----------------------------------------------------------------------------
+  # Helm Charts - For Day 2 Operations
+  #----------------------------------------------------------------------------
+  helm: {}
+
+#------------------------------------------------------------------------------
+# Notes:
+#------------------------------------------------------------------------------
+#
+# NVIDIA AI Enterprise (NVAIE) images:
+# These are NOT included in this config because they require NGC credentials
+# and are typically large. Mirror them separately using:
+#
+#   # Login to NGC
+#   docker login nvcr.io
+#
+#   # Pull and push specific images
+#   docker pull nvcr.io/nvidia/tritonserver:24.01-py3
+#   docker tag nvcr.io/nvidia/tritonserver:24.01-py3 registry:5000/nvidia/tritonserver:24.01-py3
+#   docker push registry:5000/nvidia/tritonserver:24.01-py3
+#
+# Cilium Enterprise v1.18 images:
+# The certified-operators catalog (CLIFE channel 1.18) will automatically pull
+# most Cilium Enterprise images. The CLIFE operator image is explicitly listed
+# in additionalImages because it's required by the Day 1 manifest.
+#
+# Tetragon Enterprise v1.18:
+# Deployed via its own OLM catalog (quay.io/isovalent/tetragon-operator-index)
+# which is included in the operators section above.
+#
+# Estimated sizes:
+# - OpenShift 4.19 platform: ~15-20 GB
+# - Selected operators:      ~5-10 GB
+# - Cilium images:           ~2-3 GB
+# - Total:                   ~25-35 GB
+#
+#------------------------------------------------------------------------------

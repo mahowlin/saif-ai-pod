@@ -1,0 +1,430 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+#
+# This software is licensed to you under the terms of the Cisco Sample
+# Code License, Version 1.1 (the "License"). You may obtain a copy of the
+# License at
+#
+#                https://developer.cisco.com/docs/licenses
+#
+# All use of the material herein must be in accordance with the terms of
+# the License. All rights not expressly granted by the License are
+# reserved. Unless required by applicable law or agreed to separately in
+# writing, software distributed under the License is distributed on an "AS
+# IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied.
+
+name: 'Validate Day 0 Prerequisites'
+
+# Validates Day 0 infrastructure prerequisites that must be manually configured:
+# - DNS records (registry, api, api-int, *.apps)
+# - GitHub secrets (REDHAT_PULL_SECRET, SSH_PUBLIC_KEY, INTERSIGHT_*)
+# - Red Hat registry authentication (tests token fetch from SSO)
+# - Intersight API authentication (tests API call via isctl)
+# - Registry container running and accessible
+# - Network connectivity (gateway, DNS servers)
+#
+# Role in Deployment Lifecycle:
+#   Day 0 Prerequisites → ucs/validate → ucs/deploy → ucs/test →
+#   openshift/validate → openshift/deploy → openshift/test
+#
+# Usage:
+#   gh workflow run validate-prerequisites.yaml -f cluster_name=ai-pod-1
+#
+# Design Principles:
+#   - Validates manually-configured infrastructure only
+#   - Reads from rendered configs (openshift/data/$CLUSTER/)
+#   - Fail-fast: Stops before deployment if infrastructure not ready
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'Cluster name (ai-pod-1, ai-pod-2, etc.)'
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      cluster_name:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: 'Prerequisites Validation'
+    runs-on: [self-hosted, linux, saif-github-runner]
+    container:
+      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Load Configuration
+      id: config
+      run: |
+        CLUSTER="${{ inputs.cluster_name }}"
+        INSTALL_CONFIG="openshift/data/$CLUSTER/install-config.yaml"
+        AGENT_CONFIG="openshift/data/$CLUSTER/agent-config.yaml"
+
+        echo "## Cluster Configuration" >> $GITHUB_STEP_SUMMARY
+        echo "Cluster: **$CLUSTER**" >> $GITHUB_STEP_SUMMARY
+
+        # Check rendered configs exist
+        if [ ! -f "$INSTALL_CONFIG" ]; then
+          echo "ERROR: Rendered config not found: $INSTALL_CONFIG"
+          echo "Run: python scripts/render-cluster-config.py $CLUSTER"
+          exit 1
+        fi
+
+        # Extract values from rendered install-config.yaml
+        # Note: yq in container is Python yq - requires -r for raw (unquoted) output
+        BASE_DOMAIN=$(yq -r '.baseDomain' $INSTALL_CONFIG)
+        MACHINE_CIDR=$(yq -r '.networking.machineNetwork[0].cidr' $INSTALL_CONFIG)
+
+        # Extract registry hostname from imageContentSources
+        REGISTRY_MIRROR=$(yq -r '.imageContentSources[0].mirrors[0]' $INSTALL_CONFIG)
+        REGISTRY_FQDN=$(echo $REGISTRY_MIRROR | cut -d':' -f1 | sed 's|/.*||')
+
+        # Extract values from rendered agent-config.yaml
+        # Note: Keys with dashes must be quoted for Python yq
+        NODE_IP=$(yq -r '.rendezvousIP' $AGENT_CONFIG)
+        GATEWAY_IP=$(yq -r '.hosts[0].networkConfig.routes.config[0]."next-hop-address"' $AGENT_CONFIG)
+        DNS_PRIMARY=$(yq -r '.hosts[0].networkConfig."dns-resolver".config.server[0]' $AGENT_CONFIG)
+        DNS_SECONDARY=$(yq -r '.hosts[0].networkConfig."dns-resolver".config.server[1]' $AGENT_CONFIG 2>/dev/null || echo "")
+
+        # Runner VM IP (infrastructure-specific)
+        RUNNER_VM_IP="10.0.0.10"
+
+        # Export for other steps
+        echo "CLUSTER_NAME=$CLUSTER" >> $GITHUB_ENV
+        echo "BASE_DOMAIN=$BASE_DOMAIN" >> $GITHUB_ENV
+        echo "REGISTRY_FQDN=$REGISTRY_FQDN" >> $GITHUB_ENV
+        echo "NODE_IP=$NODE_IP" >> $GITHUB_ENV
+        echo "GATEWAY_IP=$GATEWAY_IP" >> $GITHUB_ENV
+        echo "DNS_PRIMARY=$DNS_PRIMARY" >> $GITHUB_ENV
+        echo "DNS_SECONDARY=$DNS_SECONDARY" >> $GITHUB_ENV
+        echo "RUNNER_VM_IP=$RUNNER_VM_IP" >> $GITHUB_ENV
+        echo "MACHINE_CIDR=$MACHINE_CIDR" >> $GITHUB_ENV
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Configuration loaded from rendered configs:**" >> $GITHUB_STEP_SUMMARY
+        echo "- Base Domain: $BASE_DOMAIN" >> $GITHUB_STEP_SUMMARY
+        echo "- Registry: $REGISTRY_FQDN" >> $GITHUB_STEP_SUMMARY
+        echo "- Node IP: $NODE_IP" >> $GITHUB_STEP_SUMMARY
+        echo "- Gateway: $GATEWAY_IP" >> $GITHUB_STEP_SUMMARY
+
+    - name: Validate GitHub Secrets
+      run: |
+        echo "## GitHub Secrets Validation" >> $GITHUB_STEP_SUMMARY
+        VALIDATION_FAILED=0
+
+        # Check if REDHAT_PULL_SECRET exists (test by checking if it's empty)
+        if [ -z "${{ secrets.REDHAT_PULL_SECRET }}" ]; then
+          echo "❌ REDHAT_PULL_SECRET is not set" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        else
+          echo "✅ REDHAT_PULL_SECRET exists" >> $GITHUB_STEP_SUMMARY
+
+          # Validate it's valid JSON with auths field
+          if echo '${{ secrets.REDHAT_PULL_SECRET }}' | jq -e '.auths' > /dev/null 2>&1; then
+            echo "✅ REDHAT_PULL_SECRET is valid JSON" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ REDHAT_PULL_SECRET is malformed (not valid JSON or missing .auths)" >> $GITHUB_STEP_SUMMARY
+            VALIDATION_FAILED=1
+          fi
+        fi
+
+        # Check SSH_PUBLIC_KEY exists
+        if [ -z "${{ secrets.SSH_PUBLIC_KEY }}" ]; then
+          echo "❌ SSH_PUBLIC_KEY is not set" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        else
+          echo "✅ SSH_PUBLIC_KEY exists" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        # Check Intersight credentials exist
+        if [ -z "${{ secrets.INTERSIGHT_API_KEY_ID }}" ]; then
+          echo "❌ INTERSIGHT_API_KEY_ID is not set" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        else
+          echo "✅ INTERSIGHT_API_KEY_ID exists" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        if [ -z "${{ secrets.INTERSIGHT_SECRET_KEY }}" ]; then
+          echo "❌ INTERSIGHT_SECRET_KEY is not set" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        else
+          echo "✅ INTERSIGHT_SECRET_KEY exists" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        if [ $VALIDATION_FAILED -eq 1 ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**❌ GitHub Secrets validation FAILED**" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+    - name: Test Red Hat Registry Authentication
+      shell: bash
+      run: |
+        echo "## Red Hat Registry Authentication" >> $GITHUB_STEP_SUMMARY
+        VALIDATION_FAILED=0
+
+        # Write pull secret to temp file
+        echo '${{ secrets.REDHAT_PULL_SECRET }}' > /tmp/auth.json
+
+        # Check auth file format (redact sensitive values)
+        REGISTRIES=$(jq -r '.auths | keys | join(", ")' /tmp/auth.json 2>/dev/null || echo 'parse error')
+        echo "Auth file contains credentials for: $REGISTRIES" >> $GITHUB_STEP_SUMMARY
+
+        # Test registry.redhat.io
+        # Get credentials from pull secret
+        CREDS=$(jq -r '.auths."registry.redhat.io".auth // empty' /tmp/auth.json)
+        if [ -z "$CREDS" ]; then
+          echo "❌ registry.redhat.io - no credentials in pull secret" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        else
+          # Test by fetching a bearer token from Red Hat SSO
+          # This is the proper way to validate credentials
+          TOKEN_RESPONSE=$(curl -s -u "$(echo $CREDS | base64 -d)" \
+            "https://sso.redhat.com/auth/realms/rhcc/protocol/redhat-docker-v2/auth?service=docker-registry&scope=repository:ubi9/ubi:pull" 2>&1)
+
+          if echo "$TOKEN_RESPONSE" | jq -e '.token' > /dev/null 2>&1; then
+            echo "✅ registry.redhat.io authentication successful" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ registry.redhat.io authentication FAILED" >> $GITHUB_STEP_SUMMARY
+            echo "   Error: Could not obtain bearer token" >> $GITHUB_STEP_SUMMARY
+            VALIDATION_FAILED=1
+          fi
+        fi
+
+        # Test quay.io
+        CREDS=$(jq -r '.auths."quay.io".auth // empty' /tmp/auth.json)
+        if [ -z "$CREDS" ]; then
+          echo "❌ quay.io - no credentials in pull secret" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        else
+          # Test by authenticating to quay.io v2 API
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Basic $CREDS" \
+            "https://quay.io/v2/auth?service=quay.io&scope=repository:openshift-release-dev/ocp-release:pull" 2>&1)
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ quay.io authentication successful" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ quay.io authentication FAILED (HTTP $HTTP_CODE)" >> $GITHUB_STEP_SUMMARY
+            VALIDATION_FAILED=1
+          fi
+        fi
+
+        # Clean up
+        rm -f /tmp/auth.json
+
+        if [ $VALIDATION_FAILED -eq 1 ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**❌ Red Hat registry authentication FAILED**" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+    - name: Test Intersight API Authentication
+      shell: bash
+      env:
+        INTERSIGHT_API_KEY_ID: ${{ secrets.INTERSIGHT_API_KEY_ID }}
+        INTERSIGHT_SECRET_KEY: ${{ secrets.INTERSIGHT_SECRET_KEY }}
+      run: |
+        echo "## Intersight API Authentication" >> $GITHUB_STEP_SUMMARY
+        VALIDATION_FAILED=0
+
+        # Test API access by listing organizations (minimal API call)
+        if isctl get organization organization --top 1 -o json > /tmp/isctl_output.json 2>&1; then
+          echo "✅ Intersight API authentication successful" >> $GITHUB_STEP_SUMMARY
+
+          # Get org name for verification
+          ORG_NAME=$(jq -r '.[0].Name // "unknown"' /tmp/isctl_output.json 2>/dev/null || echo "unknown")
+          echo "   Connected to organization: $ORG_NAME" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ Intersight API authentication FAILED" >> $GITHUB_STEP_SUMMARY
+          echo "   Error: $(cat /tmp/isctl_output.json 2>/dev/null | head -1)" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        fi
+
+        # Clean up
+        rm -f /tmp/isctl_output.json
+
+        if [ $VALIDATION_FAILED -eq 1 ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**❌ Intersight API authentication FAILED**" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+    - name: Validate DNS
+      run: |
+        echo "## DNS Validation" >> $GITHUB_STEP_SUMMARY
+        VALIDATION_FAILED=0
+
+        # Check DNS servers are reachable
+        for dns in $DNS_PRIMARY $DNS_SECONDARY; do
+          [ -z "$dns" ] && continue  # Skip if secondary DNS not configured
+          if ping -c 1 -W 2 $dns > /dev/null 2>&1; then
+            echo "✅ DNS server $dns is reachable" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ DNS server $dns is NOT reachable" >> $GITHUB_STEP_SUMMARY
+            VALIDATION_FAILED=1
+          fi
+        done
+
+        # Check registry DNS resolution (use getent hosts - nslookup not installed)
+        if getent hosts $REGISTRY_FQDN > /dev/null 2>&1; then
+          REGISTRY_IP=$(getent hosts $REGISTRY_FQDN | awk '{print $1}')
+          echo "✅ $REGISTRY_FQDN resolves to $REGISTRY_IP" >> $GITHUB_STEP_SUMMARY
+
+          # Verify it resolves to expected IP
+          if [ "$REGISTRY_IP" != "$RUNNER_VM_IP" ]; then
+            echo "⚠️  Warning: Expected $RUNNER_VM_IP, got $REGISTRY_IP" >> $GITHUB_STEP_SUMMARY
+          fi
+        else
+          echo "❌ $REGISTRY_FQDN does NOT resolve" >> $GITHUB_STEP_SUMMARY
+          echo "   Create DNS A record: $REGISTRY_FQDN → $RUNNER_VM_IP" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        fi
+
+        # Check OpenShift DNS records
+        for record in "api.$CLUSTER_NAME" "api-int.$CLUSTER_NAME"; do
+          if getent hosts ${record}.$BASE_DOMAIN > /dev/null 2>&1; then
+            RESOLVED_IP=$(getent hosts ${record}.$BASE_DOMAIN | awk '{print $1}')
+            echo "✅ ${record}.$BASE_DOMAIN → $RESOLVED_IP" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ ${record}.$BASE_DOMAIN does NOT resolve" >> $GITHUB_STEP_SUMMARY
+            echo "   Create DNS A record: ${record}.$BASE_DOMAIN → $NODE_IP" >> $GITHUB_STEP_SUMMARY
+            VALIDATION_FAILED=1
+          fi
+        done
+
+        if [ $VALIDATION_FAILED -eq 1 ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**❌ DNS validation FAILED**" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+    - name: Validate Registry
+      run: |
+        echo "## Registry Validation" >> $GITHUB_STEP_SUMMARY
+        VALIDATION_FAILED=0
+
+        # Check registry API accessible (uses HTTPS with self-signed cert)
+        REGISTRY_URL="https://$REGISTRY_FQDN:5000"
+        if curl -skf $REGISTRY_URL/v2/ > /dev/null; then
+          echo "✅ Registry API is accessible at $REGISTRY_URL" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ Registry API is NOT accessible at $REGISTRY_URL/v2/" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        fi
+
+        # Check images mirrored (warning only - sync-images handles this)
+        REPO_COUNT=$(curl -sk $REGISTRY_URL/v2/_catalog | jq -r '.repositories | length' 2>/dev/null || echo "0")
+        if [ "$REPO_COUNT" -gt 0 ]; then
+          echo "✅ Registry has $REPO_COUNT repositories" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "⚠️  Registry is empty - run sync-images.yaml first" >> $GITHUB_STEP_SUMMARY
+          # Don't fail - images may not be mirrored yet
+        fi
+
+        # Check web server accessible (for ISO hosting)
+        WEB_URL="${{ vars.OCP_ISO_SERVER_URL }}"
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$WEB_URL/" 2>/dev/null || echo "000")
+        if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "403" ]; then
+          echo "✅ Web server accessible at $WEB_URL" >> $GITHUB_STEP_SUMMARY
+        elif [ "$HTTP_CODE" = "401" ]; then
+          echo "✅ Web server accessible at $WEB_URL (requires auth)" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ Web server NOT accessible at $WEB_URL (HTTP $HTTP_CODE)" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        fi
+
+        if [ $VALIDATION_FAILED -eq 1 ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**❌ Registry validation FAILED**" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+    - name: Validate Configuration Files
+      working-directory: .
+      run: |
+        echo "## Configuration Files Validation" >> $GITHUB_STEP_SUMMARY
+        VALIDATION_FAILED=0
+        CLUSTER="${{ inputs.cluster_name }}"
+
+        # Check images-list.yaml
+        if [ -f mirror/images-list.yaml ]; then
+          echo "✅ mirror/images-list.yaml exists" >> $GITHUB_STEP_SUMMARY
+
+          # Validate YAML syntax
+          if yq -r '.' mirror/images-list.yaml > /dev/null 2>&1; then
+            echo "✅ mirror/images-list.yaml is valid YAML" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ mirror/images-list.yaml has YAML syntax errors" >> $GITHUB_STEP_SUMMARY
+            VALIDATION_FAILED=1
+          fi
+        else
+          echo "❌ mirror/images-list.yaml not found" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        fi
+
+        # Check rendered OpenShift configs
+        for file in install-config.yaml agent-config.yaml; do
+          if [ -f "openshift/data/$CLUSTER/$file" ]; then
+            echo "✅ openshift/data/$CLUSTER/$file exists" >> $GITHUB_STEP_SUMMARY
+
+            # Validate YAML syntax
+            if yq -r '.' "openshift/data/$CLUSTER/$file" > /dev/null 2>&1; then
+              echo "✅ openshift/data/$CLUSTER/$file is valid YAML" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ openshift/data/$CLUSTER/$file has YAML syntax errors" >> $GITHUB_STEP_SUMMARY
+              VALIDATION_FAILED=1
+            fi
+          else
+            echo "❌ openshift/data/$CLUSTER/$file not found" >> $GITHUB_STEP_SUMMARY
+            echo "   Run: python scripts/render-cluster-config.py $CLUSTER" >> $GITHUB_STEP_SUMMARY
+            VALIDATION_FAILED=1
+          fi
+        done
+
+        if [ $VALIDATION_FAILED -eq 1 ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**❌ Configuration files validation FAILED**" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+    - name: Validate Network (Basic)
+      run: |
+        echo "## Network Validation" >> $GITHUB_STEP_SUMMARY
+        VALIDATION_FAILED=0
+
+        # Check runner VM is reachable
+        if ping -c 1 -W 2 $RUNNER_VM_IP > /dev/null 2>&1; then
+          echo "✅ Runner VM $RUNNER_VM_IP is reachable" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ Runner VM $RUNNER_VM_IP is NOT reachable" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        fi
+
+        # Check if target IP is available (not in use)
+        if ! ping -c 1 -W 2 $NODE_IP > /dev/null 2>&1; then
+          echo "✅ IP $NODE_IP is available (not responding to ping)" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "⚠️  Warning: IP $NODE_IP is already responding to ping (may be existing cluster)" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        if [ $VALIDATION_FAILED -eq 1 ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**❌ Network validation FAILED**" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+    - name: Validation Summary
+      if: always()
+      run: |
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "---" >> $GITHUB_STEP_SUMMARY
+        echo "**✅ All Day 0 prerequisites validated for cluster: ${{ inputs.cluster_name }}**" >> $GITHUB_STEP_SUMMARY

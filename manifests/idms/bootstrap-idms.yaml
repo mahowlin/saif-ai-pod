@@ -1,0 +1,52 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+# Bootstrap IDMS - Minimal mirrors for Day 1 ArgoCD installation
+# Only includes what's needed to install the OpenShift GitOps operator
+# Full IDMS is managed via Day 2 GitOps (platform-idms Application)
+#
+# This file should be kept in sync with core mirrors from saif-sys-admin.
+# When sync-images adds new namespaces needed for bootstrap, update here.
+---
+apiVersion: config.openshift.io/v1
+kind: ImageTagMirrorSet
+metadata:
+  name: bootstrap-itms
+  annotations:
+    description: "Day 1 bootstrap mirrors for ArgoCD installation"
+spec:
+  imageTagMirrors:
+  # OpenShift core images (required for OLM bundle unpacking)
+  - mirrors:
+    - registry.example.com:5000/openshift4
+    source: registry.redhat.io/openshift4
+  # OpenShift GitOps operator images
+  - mirrors:
+    - registry.example.com:5000/openshift-gitops-1
+    source: registry.redhat.io/openshift-gitops-1
+  # Red Hat operator images (for OLM operators)
+  - mirrors:
+    - registry.example.com:5000/redhat
+    source: registry.redhat.io/redhat
+---
+apiVersion: config.openshift.io/v1
+kind: ImageDigestMirrorSet
+metadata:
+  name: bootstrap-idms
+  annotations:
+    description: "Day 1 bootstrap mirrors for ArgoCD installation (digest-based)"
+spec:
+  imageDigestMirrors:
+  # OpenShift core images
+  - mirrors:
+    - registry.example.com:5000/openshift4
+    source: registry.redhat.io/openshift4
+  # OpenShift GitOps operator images
+  - mirrors:
+    - registry.example.com:5000/openshift-gitops-1
+    source: registry.redhat.io/openshift-gitops-1
+  # Red Hat operator images
+  - mirrors:
+    - registry.example.com:5000/redhat
+    source: registry.redhat.io/redhat

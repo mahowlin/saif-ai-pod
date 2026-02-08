@@ -1,0 +1,491 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+#
+# This software is licensed to you under the terms of the Cisco Sample
+# Code License, Version 1.1 (the "License"). You may obtain a copy of the
+# License at
+#
+#                https://developer.cisco.com/docs/licenses
+#
+# All use of the material herein must be in accordance with the terms of
+# the License. All rights not expressly granted by the License are
+# reserved. Unless required by applicable law or agreed to separately in
+# writing, software distributed under the License is distributed on an "AS
+# IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied.
+
+name: 'Post-Install Configuration'
+
+# Day 1 Post-Install: Minimal bootstrap configuration
+#
+# Applies ONLY what's needed to hand off to Day 2 GitOps:
+# - Bootstrap IDMS (minimal mirrors for ArgoCD installation)
+# - Sealed Secrets controller (for GitOps-managed secrets)
+# - ArgoCD GitOps operator + app-of-apps
+#
+# Day 2 GitOps (ArgoCD) manages everything else:
+# - Full IDMS (platform-idms Application)
+# - All operators and workloads
+# - All configuration
+#
+# This workflow is separated from openshift-deploy.yaml to allow:
+# - Re-running post-install steps without full ISO regeneration
+# - Fast iteration when debugging ArgoCD bootstrap issues
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'Target cluster'
+        required: true
+        type: choice
+        options:
+          - ai-pod-1
+          - ai-pod-2
+          - ai-pod-3
+          - ai-pod-4
+      apply_idms:
+        description: 'Download and apply latest IDMS from sync-images'
+        required: false
+        type: boolean
+        default: true
+      apply_argocd:
+        description: 'Bootstrap ArgoCD GitOps'
+        required: false
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      cluster_name:
+        type: string
+        required: true
+      apply_idms:
+        type: boolean
+        required: false
+        default: true
+      apply_argocd:
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  configure:
+    name: 'Apply Post-Install Configuration'
+    runs-on: [self-hosted, linux, saif-github-runner]
+    container:
+      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+
+    env:
+      CLUSTER: ${{ inputs.cluster_name }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Retrieve Kubeconfig
+      env:
+        SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      run: |
+        echo "## Post-Install Configuration" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Cluster:** $CLUSTER" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        # Always retrieve fresh kubeconfig via SSH
+        # This ensures we get the current cluster's certificates (not stale from repo)
+        if [ -z "$SSH_PRIVATE_KEY" ]; then
+          echo "::error::SSH_PRIVATE_KEY secret not configured"
+          exit 1
+        fi
+
+        # Get cluster IP and base domain
+        CLUSTER_IP=$(yq -r ".clusters[] | select(.name == \"$CLUSTER\") | .ip" openshift/cluster-mappings.yaml)
+        BASE_DOMAIN=$(yq -r ".infrastructure.base_domain" openshift/cluster-mappings.yaml)
+
+        if [ -z "$CLUSTER_IP" ] || [ "$CLUSTER_IP" = "null" ]; then
+          echo "::error::Cannot find IP for cluster $CLUSTER"
+          exit 1
+        fi
+
+        # SSH to cluster and retrieve recovery kubeconfig
+        echo "$SSH_PRIVATE_KEY" > /tmp/ssh_key
+        chmod 600 /tmp/ssh_key
+
+        RECOVERY_KUBECONFIG="/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/localhost-recovery.kubeconfig"
+        KUBECONFIG_FILE="/tmp/kubeconfig-${CLUSTER}"
+
+        echo "Retrieving kubeconfig via SSH to core@$CLUSTER_IP..."
+        if ssh -i /tmp/ssh_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 \
+          core@$CLUSTER_IP "sudo cat $RECOVERY_KUBECONFIG" > "$KUBECONFIG_FILE" 2>/dev/null; then
+
+          if [ -s "$KUBECONFIG_FILE" ]; then
+            # Update server URL to use cluster API endpoint (not localhost)
+            sed -i "s|server: https://localhost:6443|server: https://api.$CLUSTER.$BASE_DOMAIN:6443|g" "$KUBECONFIG_FILE"
+            sed -i "s|server: https://127.0.0.1:6443|server: https://api.$CLUSTER.$BASE_DOMAIN:6443|g" "$KUBECONFIG_FILE"
+
+            echo "✅ Kubeconfig retrieved via SSH" >> $GITHUB_STEP_SUMMARY
+            echo "KUBECONFIG=$KUBECONFIG_FILE" >> $GITHUB_ENV
+          else
+            rm -f /tmp/ssh_key
+            echo "::error::Retrieved kubeconfig is empty"
+            exit 1
+          fi
+        else
+          echo "::error::Failed to retrieve kubeconfig from cluster via SSH"
+          echo "❌ SSH to cluster failed - is the cluster operational?" >> $GITHUB_STEP_SUMMARY
+          rm -f /tmp/ssh_key
+          exit 1
+        fi
+
+        rm -f /tmp/ssh_key
+
+    - name: Verify Cluster Access
+      shell: bash
+      run: |
+        echo "Verifying cluster access..."
+
+        # Use oc get nodes as connectivity check (more reliable than oc cluster-info)
+        if ! oc get nodes --no-headers &>/dev/null; then
+          echo "::error::Cannot connect to cluster API"
+          echo "❌ Cannot connect to cluster API" >> $GITHUB_STEP_SUMMARY
+          echo "Kubeconfig: $KUBECONFIG" >> $GITHUB_STEP_SUMMARY
+          oc cluster-info 2>&1 || true
+          exit 1
+        fi
+
+        # Get cluster info
+        OCP_VERSION=$(oc get clusterversion version -o jsonpath='{.status.desired.version}' 2>/dev/null || echo "unknown")
+        NODE_COUNT=$(oc get nodes --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+
+        echo "✅ Connected to cluster" >> $GITHUB_STEP_SUMMARY
+        echo "- **OpenShift Version:** $OCP_VERSION" >> $GITHUB_STEP_SUMMARY
+        echo "- **Nodes:** $NODE_COUNT" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+    - name: Commit Kubeconfig to Repo
+      env:
+        KUBECONFIG_REPO_TOKEN: ${{ secrets.KUBECONFIG_REPO_TOKEN }}
+      run: |
+        echo "### Kubeconfig Commit" >> $GITHUB_STEP_SUMMARY
+
+        if [ -z "$KUBECONFIG_REPO_TOKEN" ]; then
+          echo "⚠️ KUBECONFIG_REPO_TOKEN not configured - skipping commit" >> $GITHUB_STEP_SUMMARY
+          exit 0
+        fi
+
+        # Clone kubeconfigs repo
+        git clone --depth 1 \
+          # Configure this URL for your kubeconfig storage repository
+          "https://x-access-token:${KUBECONFIG_REPO_TOKEN}@github.com/mahowlin/saif-kubeconfigs.git" \
+          /tmp/kubeconfigs
+
+        # Copy fresh kubeconfig to repo
+        mkdir -p "/tmp/kubeconfigs/clusters/${CLUSTER}"
+        cp "$KUBECONFIG" "/tmp/kubeconfigs/clusters/${CLUSTER}/kubeconfig"
+
+        cd /tmp/kubeconfigs
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add "clusters/${CLUSTER}/kubeconfig"
+
+        if ! git diff --staged --quiet; then
+          git commit -m "Update kubeconfig for ${CLUSTER} (run ${{ github.run_id }})"
+
+          # Retry push with rebase if race condition occurs
+          MAX_RETRIES=3
+          for i in $(seq 1 $MAX_RETRIES); do
+            if git push; then
+              echo "✅ Kubeconfig committed to repo" >> $GITHUB_STEP_SUMMARY
+              break
+            else
+              if [ $i -lt $MAX_RETRIES ]; then
+                echo "Push failed (attempt $i/$MAX_RETRIES), rebasing and retrying..."
+                git pull --rebase
+              else
+                echo "❌ Failed to push after $MAX_RETRIES attempts" >> $GITHUB_STEP_SUMMARY
+                exit 1
+              fi
+            fi
+          done
+        else
+          echo "ℹ️ Kubeconfig unchanged" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+    - name: Verify IDMS Configuration
+      run: |
+        echo "### IDMS Status" >> $GITHUB_STEP_SUMMARY
+
+        # Check for existing IDMS resources
+        IDMS_COUNT=$(oc get imagedigestmirrorset --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+        IDMS_COUNT="${IDMS_COUNT:-0}"
+        ITMS_COUNT=$(oc get imagetagmirrorset --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+        ITMS_COUNT="${ITMS_COUNT:-0}"
+
+        if [ "$IDMS_COUNT" -gt 0 ] || [ "$ITMS_COUNT" -gt 0 ]; then
+          echo "✅ Found $IDMS_COUNT IDMS and $ITMS_COUNT ITMS configurations" >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**ImageDigestMirrorSets:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          oc get imagedigestmirrorset 2>/dev/null >> $GITHUB_STEP_SUMMARY || echo "None" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**ImageTagMirrorSets:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          oc get imagetagmirrorset 2>/dev/null >> $GITHUB_STEP_SUMMARY || echo "None" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "⚠️ No IDMS/ITMS found - operators may fail to pull images" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+    - name: Apply Bootstrap IDMS
+      if: inputs.apply_idms == true
+      run: |
+        echo "### IDMS Application (Day 1 Bootstrap)" >> $GITHUB_STEP_SUMMARY
+
+        # Apply minimal bootstrap IDMS from local manifests
+        # Full IDMS is managed via Day 2 GitOps (platform-idms ArgoCD Application)
+        echo "Applying bootstrap IDMS..."
+        oc apply -f manifests/idms/bootstrap-idms.yaml
+
+        echo "✅ Applied bootstrap IDMS (openshift4, openshift-gitops-1, redhat)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Note:** Full IDMS is managed via GitOps (platform-idms Application)." >> $GITHUB_STEP_SUMMARY
+        echo "ArgoCD will sync complete IDMS after bootstrap." >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+    - name: Inject Sealed Secrets Key
+      env:
+        SEALED_SECRETS_CERT: ${{ secrets.SEALED_SECRETS_CERT }}
+        SEALED_SECRETS_KEY: ${{ secrets.SEALED_SECRETS_KEY }}
+      run: |
+        echo "### Sealed Secrets Key Injection" >> $GITHUB_STEP_SUMMARY
+
+        if [ -z "$SEALED_SECRETS_CERT" ] || [ -z "$SEALED_SECRETS_KEY" ]; then
+          echo "⚠️ SEALED_SECRETS_CERT/KEY not configured - skipping" >> $GITHUB_STEP_SUMMARY
+          echo "   Run sealed-secrets-key-bootstrap.yaml manually after ArgoCD syncs" >> $GITHUB_STEP_SUMMARY
+          exit 0
+        fi
+
+        # Create namespace (idempotent)
+        echo "Creating sealed-secrets namespace..."
+        oc apply -f manifests/sealed-secrets/00-namespace.yaml
+
+        # Inject shared key (envsubst replaces base64-encoded cert/key)
+        echo "Injecting shared sealed-secrets key..."
+        envsubst < manifests/sealed-secrets/04-shared-key.yaml | oc apply -f -
+
+        echo "✅ Sealed Secrets key injected" >> $GITHUB_STEP_SUMMARY
+        echo "   Controller will use this key when deployed by ArgoCD" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+    - name: Bootstrap ArgoCD GitOps
+      if: inputs.apply_argocd == true
+      shell: bash
+      env:
+        ARGO_GIT_TOKEN: ${{ secrets.ARGO_GIT_TOKEN }}
+      run: |
+        echo "### ArgoCD Bootstrap" >> $GITHUB_STEP_SUMMARY
+
+        # Check if ArgoCD is already installed
+        if oc get argocd openshift-gitops -n openshift-gitops &>/dev/null; then
+          echo "ArgoCD already installed, checking app-of-apps..."
+
+          # Check if saif-apps exists and points to correct path
+          CURRENT_PATH=$(oc get application saif-apps -n openshift-gitops -o jsonpath='{.spec.source.path}' 2>/dev/null || echo "")
+          EXPECTED_PATH="clusters/${CLUSTER}"
+
+          if [ "$CURRENT_PATH" = "$EXPECTED_PATH" ]; then
+            echo "✅ ArgoCD configured correctly for ${CLUSTER}" >> $GITHUB_STEP_SUMMARY
+
+            # Update credentials in case they changed
+            echo "Updating GitHub credentials..."
+            envsubst < manifests/argocd/02-github-repo-secret.yaml | oc apply -f -
+            echo "✅ GitHub credentials updated" >> $GITHUB_STEP_SUMMARY
+
+            # Ensure TLS trust is configured (idempotent)
+            if oc get cm user-ca-bundle -n openshift-config &>/dev/null; then
+              oc get cm user-ca-bundle -n openshift-config -o jsonpath='{.data.ca-bundle\.crt}' > /tmp/registry-ca.crt
+              oc create configmap argocd-tls-certs-cm -n openshift-gitops \
+                --from-file="registry.example.com=/tmp/registry-ca.crt" \
+                --dry-run=client -o yaml | oc apply -f -
+              echo "✅ ArgoCD TLS trust ensured" >> $GITHUB_STEP_SUMMARY
+            fi
+            exit 0
+          else
+            echo "Updating app-of-apps path from '$CURRENT_PATH' to '$EXPECTED_PATH'..."
+          fi
+        fi
+
+        # Step 1: Install OpenShift GitOps Operator (if not present)
+        if ! oc get csv -n openshift-operators 2>/dev/null | grep -q "openshift-gitops-operator.*Succeeded"; then
+          # Check if subscription exists in failed state - clean up first for idempotency
+          SUB_STATUS=$(oc get subscription openshift-gitops-operator -n openshift-operators -o jsonpath='{.status.conditions[?(@.type=="BundleUnpackFailed")].status}' 2>/dev/null || echo "")
+          if [ "$SUB_STATUS" = "True" ]; then
+            echo "Found failed subscription, cleaning up for retry..."
+            oc delete subscription openshift-gitops-operator -n openshift-operators 2>/dev/null || true
+            # Refresh catalog pod to pick up IDMS changes
+            oc delete pod -n openshift-marketplace -l olm.catalogSource=redhat-operators-local 2>/dev/null || true
+            echo "Waiting for catalog pod to restart..."
+            sleep 30
+          fi
+
+          echo "Installing OpenShift GitOps operator..."
+          oc apply -f manifests/argocd/01-subscription.yaml
+
+          # Wait for operator
+          echo "Waiting for operator installation..."
+          for i in {1..30}; do
+            if oc get csv -n openshift-operators 2>/dev/null | grep -q "openshift-gitops-operator.*Succeeded"; then
+              echo "✅ Operator installed" >> $GITHUB_STEP_SUMMARY
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "❌ Operator installation timeout" >> $GITHUB_STEP_SUMMARY
+              exit 1
+            fi
+            echo "Waiting for operator... ($i/30)"
+            sleep 10
+          done
+        else
+          echo "✅ Operator already installed" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        # Step 2: Wait for ArgoCD instance
+        echo "Waiting for ArgoCD instance..."
+        for i in {1..30}; do
+          if oc get argocd openshift-gitops -n openshift-gitops &>/dev/null; then
+            echo "✅ ArgoCD instance ready" >> $GITHUB_STEP_SUMMARY
+            break
+          fi
+          if [ "$i" -eq 30 ]; then
+            echo "❌ ArgoCD instance timeout" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          echo "Waiting for ArgoCD... ($i/30)"
+          sleep 10
+        done
+
+        # Step 3: Configure GitHub credentials for ArgoCD
+        echo "Configuring GitHub credentials..."
+        envsubst < manifests/argocd/02-github-repo-secret.yaml | oc apply -f -
+        echo "✅ GitHub credentials configured" >> $GITHUB_STEP_SUMMARY
+
+        # Step 4: Grant controller cluster-admin
+        echo "Configuring ArgoCD RBAC..."
+        oc apply -f manifests/argocd/04-controller-rbac.yaml
+        echo "✅ ArgoCD controller granted cluster-admin" >> $GITHUB_STEP_SUMMARY
+
+        # Step 5: Configure ArgoCD TLS trust for OCI registry
+        # The registry CA is already in user-ca-bundle (from install-config additionalTrustBundle)
+        # ArgoCD needs this to pull Helm charts from the OCI registry
+        echo "Configuring ArgoCD TLS trust for OCI registry..."
+        if oc get cm user-ca-bundle -n openshift-config &>/dev/null; then
+          oc get cm user-ca-bundle -n openshift-config -o jsonpath='{.data.ca-bundle\.crt}' > /tmp/registry-ca.crt
+          oc create configmap argocd-tls-certs-cm -n openshift-gitops \
+            --from-file="registry.example.com=/tmp/registry-ca.crt" \
+            --dry-run=client -o yaml | oc apply -f -
+          echo "✅ ArgoCD TLS trust configured for OCI registry" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "⚠️ No user-ca-bundle found, skipping OCI TLS config" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        # Step 6: Apply cluster-specific App-of-Apps
+        # CLUSTER env var is set at job level
+        echo "Applying App-of-Apps for ${CLUSTER}..."
+        envsubst < manifests/argocd/03-app-of-apps.yaml | oc apply -f -
+        echo "✅ App-of-Apps applied (path: clusters/${CLUSTER})" >> $GITHUB_STEP_SUMMARY
+
+        # Step 7: Wait for sync
+        echo "Waiting for initial sync..."
+        for i in {1..20}; do
+          SYNC_STATUS=$(oc get application saif-apps -n openshift-gitops -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "Unknown")
+          HEALTH_STATUS=$(oc get application saif-apps -n openshift-gitops -o jsonpath='{.status.health.status}' 2>/dev/null || echo "Unknown")
+
+          if [ "$SYNC_STATUS" = "Synced" ]; then
+            echo "✅ ArgoCD synced successfully" >> $GITHUB_STEP_SUMMARY
+            break
+          fi
+          if [ "$i" -eq 20 ]; then
+            echo "⚠️ ArgoCD sync pending (status: $SYNC_STATUS, health: $HEALTH_STATUS)" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "Sync status: $SYNC_STATUS, Health: $HEALTH_STATUS ($i/20)"
+          sleep 15
+        done
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "✅ ArgoCD bootstrap complete" >> $GITHUB_STEP_SUMMARY
+
+    - name: Cluster Cleanup
+      shell: bash
+      run: |
+        echo "### Cluster Cleanup" >> $GITHUB_STEP_SUMMARY
+
+        # Delete assisted-installer namespace (no longer needed after install)
+        if oc get namespace assisted-installer >/dev/null 2>&1; then
+          oc delete namespace assisted-installer --wait=false
+          echo "✅ Deleted assisted-installer namespace" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "ℹ️ assisted-installer namespace not present" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        # Clean up failed/completed installer pods in control plane namespaces
+        CLEANED=0
+        for ns in openshift-etcd openshift-kube-apiserver openshift-kube-controller-manager openshift-kube-scheduler; do
+          # Delete Error pods (failed installers where retry succeeded)
+          ERROR_PODS=$(oc get pods -n $ns --field-selector=status.phase=Failed -o name 2>/dev/null || true)
+          if [ -n "$ERROR_PODS" ]; then
+            echo "$ERROR_PODS" | xargs -r oc delete -n $ns
+            CLEANED=$((CLEANED + 1))
+          fi
+
+          # Delete old Completed installer/pruner pods (keep last 2)
+          COMPLETED_PODS=$(oc get pods -n $ns --field-selector=status.phase=Succeeded -o name 2>/dev/null | head -n -2 || true)
+          if [ -n "$COMPLETED_PODS" ]; then
+            echo "$COMPLETED_PODS" | xargs -r oc delete -n $ns
+            CLEANED=$((CLEANED + 1))
+          fi
+        done
+
+        if [ "$CLEANED" -gt 0 ]; then
+          echo "✅ Cleaned up old installer pods" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "ℹ️ No old pods to clean up" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+    - name: Summary
+      run: |
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "---" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Configuration Applied" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Component | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| IDMS Verification | ✅ |" >> $GITHUB_STEP_SUMMARY
+
+        if [ "${{ inputs.apply_idms }}" = "true" ]; then
+          echo "| IDMS Application | ✅ |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "| IDMS Application | Skipped |" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        if [ "${{ inputs.apply_argocd }}" = "true" ]; then
+          echo "| ArgoCD Bootstrap | ✅ |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "| ArgoCD Bootstrap | Skipped |" >> $GITHUB_STEP_SUMMARY
+        fi
+
+    - name: Cleanup
+      if: always()
+      run: |
+        rm -rf /tmp/kubeconfigs /tmp/kubeconfig-* /tmp/idms-download /tmp/ssh_key

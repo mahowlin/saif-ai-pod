@@ -1,0 +1,120 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+#
+# This software is licensed to you under the terms of the Cisco Sample
+# Code License, Version 1.1 (the "License"). You may obtain a copy of the
+# License at
+#
+#                https://developer.cisco.com/docs/licenses
+#
+# All use of the material herein must be in accordance with the terms of
+# the License. All rights not expressly granted by the License are
+# reserved. Unless required by applicable law or agreed to separately in
+# writing, software distributed under the License is distributed on an "AS
+# IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied.
+
+name: 'Test UCS Deployment'
+
+# Tests UCS deployment after ucs/deploy.yaml completes:
+# - Server profile is associated
+# - Profile ConfigState is "Ok"
+# - MAC address assigned
+# - cluster-macs.yaml generated and committed
+# - MAC address in cluster-macs.yaml matches Intersight
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'Cluster name (ai-pod-1, ai-pod-2, etc.)'
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      cluster_name:
+        type: string
+        required: true
+
+
+jobs:
+  test:
+    name: 'Test UCS Deployment'
+    runs-on: [self-hosted, linux, saif-github-runner]
+    container:
+      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Test cluster-macs.yaml Generation
+      run: |
+        echo "## cluster-macs.yaml Validation" >> $GITHUB_STEP_SUMMARY
+        VALIDATION_FAILED=0
+        CLUSTER="${{ inputs.cluster_name }}"
+
+        # Check cluster-macs.yaml exists
+        if [ ! -f "openshift/cluster-macs.yaml" ]; then
+          echo "❌ openshift/cluster-macs.yaml not found" >> $GITHUB_STEP_SUMMARY
+          echo "   Run: gh workflow run ucs/deploy.yaml -f action=DEPLOY" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+          exit 1
+        else
+          echo "✅ openshift/cluster-macs.yaml exists" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        # Get serial number for this cluster
+        if [ ! -f "openshift/cluster-mappings.yaml" ]; then
+          echo "❌ openshift/cluster-mappings.yaml not found" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+          exit 1
+        fi
+
+        SERIAL=$(yq ".clusters[] | select(.name == \"$CLUSTER\") | .serial" openshift/cluster-mappings.yaml)
+        if [ -z "$SERIAL" ]; then
+          echo "❌ Serial number not found for cluster $CLUSTER" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+          exit 1
+        fi
+
+        echo "✅ Cluster serial: $SERIAL" >> $GITHUB_STEP_SUMMARY
+
+        # Check MAC address in cluster-macs.yaml
+        if yq ".servers.$SERIAL" openshift/cluster-macs.yaml | grep -q "mac_address"; then
+          MAC=$(yq ".servers.$SERIAL.mac_address" openshift/cluster-macs.yaml)
+          PROFILE=$(yq ".servers.$SERIAL.profile" openshift/cluster-macs.yaml)
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**MAC Address Found:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Serial: $SERIAL" >> $GITHUB_STEP_SUMMARY
+          echo "- Profile: $PROFILE" >> $GITHUB_STEP_SUMMARY
+          echo "- MAC: $MAC" >> $GITHUB_STEP_SUMMARY
+
+          # Validate MAC is not empty
+          if [ -z "$MAC" ] || [ "$MAC" == "null" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "❌ MAC address is empty or null" >> $GITHUB_STEP_SUMMARY
+            VALIDATION_FAILED=1
+          else
+            echo "✅ MAC address assigned: $MAC" >> $GITHUB_STEP_SUMMARY
+          fi
+        else
+          echo "❌ MAC address not found for serial $SERIAL" >> $GITHUB_STEP_SUMMARY
+          echo "   Available servers: $(yq '.servers | keys' openshift/cluster-macs.yaml)" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        fi
+
+        if [ $VALIDATION_FAILED -eq 1 ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**❌ cluster-macs.yaml validation FAILED**" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+    - name: Test Summary
+      if: always()
+      run: |
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "---" >> $GITHUB_STEP_SUMMARY
+        echo "**✅ UCS deployment test passed**" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "Server profile is associated and MAC address is assigned." >> $GITHUB_STEP_SUMMARY

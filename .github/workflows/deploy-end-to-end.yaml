@@ -1,0 +1,135 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+#
+# This software is licensed to you under the terms of the Cisco Sample
+# Code License, Version 1.1 (the "License"). You may obtain a copy of the
+# License at
+#
+#                https://developer.cisco.com/docs/licenses
+#
+# All use of the material herein must be in accordance with the terms of
+# the License. All rights not expressly granted by the License are
+# reserved. Unless required by applicable law or agreed to separately in
+# writing, software distributed under the License is distributed on an "AS
+# IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied.
+
+name: 'Deploy End-to-End'
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - DRY-RUN
+          - DEPLOY
+        default: 'DRY-RUN'
+      phases:
+        description: 'Phases to run (comma-separated: sync-images,ucs,openshift,argocd)'
+        required: false
+        type: string
+        default: 'ucs'
+      environment:
+        description: 'Target environment'
+        required: false
+        type: choice
+        options:
+          - example
+        default: 'example'
+      skip_validation:
+        description: 'Skip CI validation step'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  ci-validation:
+    name: 'CI Validation'
+    if: inputs.skip_validation == false
+    uses: ./.github/workflows/ci-validation.yaml
+
+  sync-images:
+    name: 'Sync Images (Phase 0b)'
+    needs: [ci-validation]
+    if: |
+      always() &&
+      (needs.ci-validation.result == 'success' || needs.ci-validation.result == 'skipped' || inputs.skip_validation == true) &&
+      contains(inputs.phases, 'sync-images')
+    uses: ./.github/workflows/sync-images.yaml
+    with:
+      dry_run: ${{ inputs.action == 'DRY-RUN' }}
+    secrets:
+      REDHAT_PULL_SECRET: ${{ secrets.REDHAT_PULL_SECRET }}
+
+  deploy-ucs:
+    name: 'Deploy UCS (Phase 1)'
+    needs: [ci-validation, sync-images]
+    if: |
+      always() &&
+      (needs.ci-validation.result == 'success' || needs.ci-validation.result == 'skipped' || inputs.skip_validation == true) &&
+      (needs.sync-images.result == 'success' || needs.sync-images.result == 'skipped') &&
+      contains(inputs.phases, 'ucs')
+    uses: ./.github/workflows/ucs-deploy.yaml
+    with:
+      action: ${{ inputs.action }}
+    secrets:
+      INTERSIGHT_API_KEY_ID: ${{ secrets.INTERSIGHT_API_KEY_ID }}
+      INTERSIGHT_SECRET_KEY: ${{ secrets.INTERSIGHT_SECRET_KEY }}
+
+  deploy-openshift:
+    name: 'Deploy OpenShift (Phase 2)'
+    needs: [ci-validation, deploy-ucs]
+    if: |
+      always() &&
+      (needs.ci-validation.result == 'success' || needs.ci-validation.result == 'skipped' || inputs.skip_validation == true) &&
+      (needs.deploy-ucs.result == 'success' || needs.deploy-ucs.result == 'skipped') &&
+      contains(inputs.phases, 'openshift')
+    uses: ./.github/workflows/openshift-deploy.yaml
+    with:
+      environment: ${{ inputs.environment }}
+      action: ${{ inputs.action == 'DRY-RUN' && 'generate-iso' || 'generate-iso' }}
+    secrets:
+      REDHAT_PULL_SECRET: ${{ secrets.REDHAT_PULL_SECRET }}
+      SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+
+  deploy-argocd:
+    name: 'Deploy ArgoCD (Phase 3)'
+    needs: [ci-validation, deploy-openshift]
+    if: |
+      always() &&
+      (needs.ci-validation.result == 'success' || needs.ci-validation.result == 'skipped' || inputs.skip_validation == true) &&
+      (needs.deploy-openshift.result == 'success' || needs.deploy-openshift.result == 'skipped') &&
+      contains(inputs.phases, 'argocd')
+    uses: ./.github/workflows/deploy-argocd.yaml
+    with:
+      environment: ${{ inputs.environment }}
+    secrets:
+      KUBECONFIG: ${{ secrets.KUBECONFIG }}
+
+  summary:
+    name: 'Pipeline Summary'
+    needs: [ci-validation, sync-images, deploy-ucs, deploy-openshift, deploy-argocd]
+    if: always()
+    runs-on: [self-hosted, linux, saif-github-runner]
+
+    steps:
+    - name: Pipeline Summary
+      run: |
+        echo "## End-to-End Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Phase | Stage | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-------|-------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| - | CI Validation | ${{ needs.ci-validation.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| 0b | Sync Images | ${{ needs.sync-images.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| 1 | Deploy UCS | ${{ needs.deploy-ucs.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| 2 | Deploy OpenShift | ${{ needs.deploy-openshift.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| 3 | Deploy ArgoCD | ${{ needs.deploy-argocd.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Action:** ${{ inputs.action }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Phases:** ${{ inputs.phases }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY

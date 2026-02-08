@@ -1,0 +1,234 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+#
+# This software is licensed to you under the terms of the Cisco Sample
+# Code License, Version 1.1 (the "License"). You may obtain a copy of the
+# License at
+#
+#                https://developer.cisco.com/docs/licenses
+#
+# All use of the material herein must be in accordance with the terms of
+# the License. All rights not expressly granted by the License are
+# reserved. Unless required by applicable law or agreed to separately in
+# writing, software distributed under the License is distributed on an "AS
+# IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied.
+
+name: 'Undeploy OpenShift Cluster'
+run-name: "Undeploy ${{ inputs.cluster_name }}${{ inputs.request_id && format(' [rid={0}]', inputs.request_id) || '' }}"
+
+# This workflow removes the kubeconfig for a cluster.
+# It does NOT unassign the UCS server profile - that was found to be wrong.
+#
+# Key discoveries (2026-01-18):
+# - UCS unassignment breaks profile-to-blade binding, requires TF Apply to fix
+# - Boot order is safe: local disk first, vMedia second
+# - Deploy uses one-time boot - only triggers install when explicitly requested
+# - Redeploy only needs openshift-deploy.yaml (no UCS changes required)
+#
+# Use this workflow when:
+# - You want to mark a cluster as undeployed (remove kubeconfig)
+# - You want to trigger a fresh reinstall via openshift-deploy.yaml
+#
+# This does NOT touch UCS/Intersight - the server profile stays assigned.
+# Updated: 2026-01-18
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'Cluster to undeploy'
+        required: true
+        type: choice
+        options:
+          - ai-pod-1
+          - ai-pod-2
+          - ai-pod-3
+          - ai-pod-4
+      confirm_destroy:
+        description: 'Type cluster name to confirm destruction'
+        required: true
+        type: string
+      clean_kubeconfig:
+        description: 'Remove kubeconfig from kubeconfig storage repo'
+        type: boolean
+        default: true
+      dry_run:
+        description: 'Dry run - show what would happen without making changes'
+        type: boolean
+        default: false
+
+      request_id:
+        description: 'Orchestrator correlation ID (for run tracking)'
+        required: false
+        type: string
+        default: ''
+
+defaults:
+  run:
+    working-directory: openshift
+
+jobs:
+  undeploy:
+    name: 'Undeploy ${{ inputs.cluster_name }}'
+    runs-on: [self-hosted, linux, saif-github-runner]
+    container:
+      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+
+    env:
+      CLUSTER: ${{ inputs.cluster_name }}
+
+    steps:
+    - name: Validate Confirmation
+      run: |
+        echo "## Undeploy Confirmation" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        if [ "${{ inputs.confirm_destroy }}" != "${{ inputs.cluster_name }}" ]; then
+          echo "::error::Confirmation mismatch. You typed '${{ inputs.confirm_destroy }}' but cluster is '${{ inputs.cluster_name }}'."
+          echo "**ABORTED:** Confirmation mismatch" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "You must type the exact cluster name to confirm destruction." >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+        echo "**Confirmed:** Cluster name matches" >> $GITHUB_STEP_SUMMARY
+
+    - name: Safety Check for ai-pod-1
+      if: inputs.cluster_name == 'ai-pod-1'
+      run: |
+        echo "::warning::ai-pod-1 is the production GPU cluster. Extra confirmation required."
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Production Cluster Warning" >> $GITHUB_STEP_SUMMARY
+        echo "ai-pod-1 is typically used for production workloads and GPU demos." >> $GITHUB_STEP_SUMMARY
+        echo "Proceeding with undeploy as confirmation was provided." >> $GITHUB_STEP_SUMMARY
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Get Cluster Information
+      id: cluster-info
+      run: |
+        echo "## Cluster Information" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        # Get cluster details from cluster-mappings
+        SERIAL=$(yq -r ".clusters[] | select(.name == \"$CLUSTER\") | .serial" cluster-mappings.yaml)
+        PROFILE_NAME=$(yq -r ".clusters[] | select(.name == \"$CLUSTER\") | .ucs_profile" cluster-mappings.yaml)
+        CLUSTER_IP=$(yq -r ".clusters[] | select(.name == \"$CLUSTER\") | .ip" cluster-mappings.yaml)
+        BASE_DOMAIN=$(yq -r ".infrastructure.base_domain" cluster-mappings.yaml)
+
+        if [ -z "$SERIAL" ] || [ "$SERIAL" = "null" ]; then
+          echo "::error::Serial number not found for cluster $CLUSTER"
+          exit 1
+        fi
+
+        echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Cluster | $CLUSTER |" >> $GITHUB_STEP_SUMMARY
+        echo "| Serial | $SERIAL |" >> $GITHUB_STEP_SUMMARY
+        echo "| Profile Name | $PROFILE_NAME |" >> $GITHUB_STEP_SUMMARY
+        echo "| IP | $CLUSTER_IP |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        echo "SERIAL=$SERIAL" >> $GITHUB_OUTPUT
+        echo "PROFILE_NAME=$PROFILE_NAME" >> $GITHUB_OUTPUT
+        echo "CLUSTER_IP=$CLUSTER_IP" >> $GITHUB_OUTPUT
+        echo "BASE_DOMAIN=$BASE_DOMAIN" >> $GITHUB_OUTPUT
+
+    - name: Check Current Cluster Status
+      id: cluster-status
+      continue-on-error: true
+      run: |
+        CLUSTER_IP="${{ steps.cluster-info.outputs.CLUSTER_IP }}"
+        BASE_DOMAIN="${{ steps.cluster-info.outputs.BASE_DOMAIN }}"
+        API_URL="https://api.$CLUSTER.$BASE_DOMAIN:6443"
+
+        echo "### Current Cluster Status" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        # Check if API is responding
+        if curl -sk --connect-timeout 5 "$API_URL/version" > /dev/null 2>&1; then
+          echo "**API Status:** Responding at $API_URL" >> $GITHUB_STEP_SUMMARY
+          echo "CLUSTER_ONLINE=true" >> $GITHUB_OUTPUT
+        else
+          echo "**API Status:** Not responding (cluster may already be down)" >> $GITHUB_STEP_SUMMARY
+          echo "CLUSTER_ONLINE=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Remove Kubeconfig (Dry Run)
+      if: inputs.dry_run && inputs.clean_kubeconfig
+      run: |
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## Dry Run - Actions That Would Be Taken" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "1. **Remove kubeconfig:** \`clusters/$CLUSTER/kubeconfig\` from kubeconfig storage repo" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Note:** UCS server profile is NOT modified. The server stays assigned." >> $GITHUB_STEP_SUMMARY
+        echo "To redeploy, simply run \`openshift-deploy.yaml\` workflow." >> $GITHUB_STEP_SUMMARY
+
+    - name: Remove Kubeconfig
+      if: ${{ !inputs.dry_run && inputs.clean_kubeconfig }}
+      env:
+        GH_TOKEN: ${{ secrets.KUBECONFIG_REPO_TOKEN }}
+      run: |
+        echo "## Kubeconfig Removal" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        # Clone private repo
+        git clone --depth 1 \
+          # Configure this URL for your kubeconfig storage repository
+          "https://x-access-token:${GH_TOKEN}@github.com/mahowlin/saif-kubeconfigs.git" \
+          /tmp/kubeconfigs
+
+        cd /tmp/kubeconfigs
+
+        if [ -d "clusters/$CLUSTER" ]; then
+          rm -rf "clusters/$CLUSTER"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+
+          if git diff --staged --quiet; then
+            echo "No changes to kubeconfig repository" >> $GITHUB_STEP_SUMMARY
+          else
+            git commit -m "Remove kubeconfig for $CLUSTER (undeployed)"
+            for attempt in 1 2 3; do
+              git rebase --abort 2>/dev/null || true
+              if git pull --rebase origin main && git push; then break; fi
+              if [ $attempt -eq 3 ]; then echo "::error::Push failed after 3 attempts"; exit 1; fi
+              echo "Push race (attempt $attempt/3), retrying..."
+              sleep $((attempt * 2))
+            done
+            echo "Kubeconfig removed from repository" >> $GITHUB_STEP_SUMMARY
+          fi
+        else
+          echo "No kubeconfig found for $CLUSTER (directory does not exist)" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        rm -rf /tmp/kubeconfigs
+
+    - name: Summary
+      run: |
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "---" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+        if [ "${{ inputs.dry_run }}" = "true" ]; then
+          echo "## Dry Run Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "No changes were made. Review the actions above and run again without dry_run to execute." >> $GITHUB_STEP_SUMMARY
+        else
+          echo "## Undeploy Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Action | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Cluster | ${{ inputs.cluster_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Kubeconfig | ${{ inputs.clean_kubeconfig && 'Removed' || 'Retained' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| UCS Profile | Unchanged (stays assigned) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Run \`openshift-deploy.yaml\` to redeploy cluster" >> $GITHUB_STEP_SUMMARY
+          echo "2. The workflow will generate a new ISO and trigger one-time boot" >> $GITHUB_STEP_SUMMARY
+          echo "3. The existing disk will be overwritten with fresh install" >> $GITHUB_STEP_SUMMARY
+        fi

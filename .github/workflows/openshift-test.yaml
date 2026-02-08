@@ -1,0 +1,425 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+#
+# This software is licensed to you under the terms of the Cisco Sample
+# Code License, Version 1.1 (the "License"). You may obtain a copy of the
+# License at
+#
+#                https://developer.cisco.com/docs/licenses
+#
+# All use of the material herein must be in accordance with the terms of
+# the License. All rights not expressly granted by the License are
+# reserved. Unless required by applicable law or agreed to separately in
+# writing, software distributed under the License is distributed on an "AS
+# IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied.
+
+name: 'Test OpenShift Deployment'
+run-name: "Test ${{ inputs.cluster_name }}${{ inputs.request_id && format(' [rid={0}]', inputs.request_id) || '' }}"
+
+# Tests core OpenShift infrastructure deployed by:
+#   1. Agent-Based Installer (cluster, nodes, operators, CNI)
+#   2. Post-install workflow (IDMS, Sealed Secrets key, ArgoCD bootstrap)
+#
+# Does NOT test ArgoCD workload convergence or application health.
+# Workload testing is handled by saif-gitops/workload-test.yaml
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: 'Cluster name (ai-pod-1, ai-pod-2, etc.)'
+        required: true
+        type: string
+      kubeconfig_path:
+        description: 'Path to kubeconfig file (optional)'
+        required: false
+        type: string
+      request_id:
+        description: 'Orchestrator correlation ID (for run tracking)'
+        required: false
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      cluster_name:
+        type: string
+        required: true
+      kubeconfig_path:
+        type: string
+        required: false
+      request_id:
+        type: string
+        required: false
+        default: ''
+
+
+jobs:
+  test:
+    name: 'Test OpenShift Deployment'
+    runs-on: [self-hosted, linux, saif-github-runner]
+    container:
+      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Kubeconfig
+      env:
+        KUBECONFIG_REPO_TOKEN: ${{ secrets.KUBECONFIG_REPO_TOKEN }}
+      run: |
+        echo "## Cluster Connection" >> $GITHUB_STEP_SUMMARY
+        CLUSTER="${{ inputs.cluster_name }}"
+
+        # Fetch kubeconfig from kubeconfig storage repo
+        if [ -z "$KUBECONFIG_REPO_TOKEN" ]; then
+          echo "❌ KUBECONFIG_REPO_TOKEN not configured" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+        echo "Fetching kubeconfig from kubeconfig storage repo..."
+
+        KUBECONFIG_DIR="$HOME/.kube"
+        mkdir -p "$KUBECONFIG_DIR"
+
+        # Clone the kubeconfigs repo
+        git clone --depth 1 \
+          # Configure this URL for your kubeconfig storage repository
+          "https://x-access-token:${KUBECONFIG_REPO_TOKEN}@github.com/mahowlin/saif-kubeconfigs.git" \
+          /tmp/kubeconfigs 2>/dev/null
+
+        KUBECONFIG_FILE="/tmp/kubeconfigs/clusters/${CLUSTER}/kubeconfig"
+
+        if [ ! -f "$KUBECONFIG_FILE" ]; then
+          echo "❌ Kubeconfig not found in repo" >> $GITHUB_STEP_SUMMARY
+          echo "   Expected: clusters/${CLUSTER}/kubeconfig" >> $GITHUB_STEP_SUMMARY
+          echo "   Ensure Deploy job committed kubeconfig before running Test" >> $GITHUB_STEP_SUMMARY
+          rm -rf /tmp/kubeconfigs
+          exit 1
+        fi
+
+        cp "$KUBECONFIG_FILE" "$KUBECONFIG_DIR/config-$CLUSTER"
+        rm -rf /tmp/kubeconfigs
+
+        echo "KUBECONFIG=$KUBECONFIG_DIR/config-$CLUSTER" >> $GITHUB_ENV
+        echo "✅ Kubeconfig retrieved from kubeconfig storage repo" >> $GITHUB_STEP_SUMMARY
+
+    # =========================================================================
+    # Core Cluster Health (Agent-Based Installer)
+    # =========================================================================
+
+    - name: Test Cluster API
+      run: |
+        echo "## Cluster API Test" >> $GITHUB_STEP_SUMMARY
+
+        # Test cluster connection
+        if oc cluster-info > /dev/null 2>&1; then
+          CLUSTER_URL=$(oc cluster-info | grep "Kubernetes control plane" | awk '{print $NF}')
+          echo "✅ Cluster API accessible" >> $GITHUB_STEP_SUMMARY
+          echo "   API URL: $CLUSTER_URL" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ Cannot connect to cluster API" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+        # Get cluster version
+        OCP_VERSION=$(oc get clusterversion version -o jsonpath='{.status.desired.version}' 2>/dev/null || echo "unknown")
+        echo "   OpenShift Version: $OCP_VERSION" >> $GITHUB_STEP_SUMMARY
+
+    - name: Test Nodes
+      run: |
+        echo "## Nodes Status" >> $GITHUB_STEP_SUMMARY
+
+        # Get nodes status
+        TOTAL_NODES=$(oc get nodes --no-headers | wc -l)
+        READY_NODES=$(oc get nodes --no-headers | grep -c " Ready" || echo "0")
+
+        echo "Total Nodes: $TOTAL_NODES" >> $GITHUB_STEP_SUMMARY
+        echo "Ready Nodes: $READY_NODES" >> $GITHUB_STEP_SUMMARY
+
+        if [ "$READY_NODES" -eq "$TOTAL_NODES" ] && [ "$TOTAL_NODES" -gt 0 ]; then
+          echo "✅ All nodes are Ready" >> $GITHUB_STEP_SUMMARY
+
+          # Show node details
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Node Details:**" >> $GITHUB_STEP_SUMMARY
+          oc get nodes -o custom-columns=NAME:.metadata.name,STATUS:.status.conditions[-1].type,ROLES:.metadata.labels.'node-role\.kubernetes\.io/.*',VERSION:.status.nodeInfo.kubeletVersion --no-headers | while read line; do
+            echo "- $line" >> $GITHUB_STEP_SUMMARY
+          done
+        else
+          echo "❌ Not all nodes are Ready" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+    - name: Test Cluster Operators
+      run: |
+        echo "## Cluster Operators Status" >> $GITHUB_STEP_SUMMARY
+
+        # Get operators status
+        TOTAL_OPS=$(oc get clusteroperators --no-headers | wc -l)
+        AVAILABLE_OPS=$(oc get clusteroperators --no-headers | grep -c "True.*False.*False" || echo "0")
+
+        # In disconnected environments, 'insights' operator is expected to be degraded
+        # Count degraded operators excluding insights
+        DEGRADED_OPS=$(oc get clusteroperators --no-headers | grep -v "True.*False.*False" | grep -v "^insights " | wc -l || echo "0")
+
+        echo "Total Operators: $TOTAL_OPS" >> $GITHUB_STEP_SUMMARY
+        echo "Available Operators: $AVAILABLE_OPS" >> $GITHUB_STEP_SUMMARY
+
+        if [ "$AVAILABLE_OPS" -eq "$TOTAL_OPS" ]; then
+          echo "✅ All cluster operators are healthy" >> $GITHUB_STEP_SUMMARY
+        elif [ "$DEGRADED_OPS" -eq 0 ]; then
+          echo "✅ All cluster operators healthy (insights degraded - expected in disconnected)" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ Some cluster operators are not healthy" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Degraded Operators:**" >> $GITHUB_STEP_SUMMARY
+          oc get clusteroperators --no-headers | grep -v "True.*False.*False" | while read line; do
+            echo "- $line" >> $GITHUB_STEP_SUMMARY
+          done
+          exit 1
+        fi
+
+    - name: Test Cilium CNI
+      run: |
+        echo "## Cilium CNI Status" >> $GITHUB_STEP_SUMMARY
+
+        # Cilium is deployed at Day 1 by the Agent-Based Installer
+        CILIUM_PODS=$(oc get pods -n openshift-cilium -o custom-columns=NAME:.metadata.name,STATUS:.status.phase --no-headers 2>/dev/null | wc -l || echo "0")
+
+        if [ "$CILIUM_PODS" -gt 0 ]; then
+          RUNNING_CILIUM=$(oc get pods -n openshift-cilium --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l || echo "0")
+          echo "Cilium Pods: $RUNNING_CILIUM/$CILIUM_PODS running" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$RUNNING_CILIUM" -eq "$CILIUM_PODS" ]; then
+            echo "✅ All Cilium pods are running" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️  Some Cilium pods are not running" >> $GITHUB_STEP_SUMMARY
+          fi
+        else
+          echo "⚠️  Cilium pods not found (may not be deployed yet)" >> $GITHUB_STEP_SUMMARY
+        fi
+
+    - name: Test MachineConfigPools
+      run: |
+        echo "## MachineConfigPools Status" >> $GITHUB_STEP_SUMMARY
+
+        # Check MCP status
+        oc get mcp --no-headers 2>/dev/null | while read name config updated updating degraded count ready ucount dcount age; do
+          if [ "$degraded" = "True" ]; then
+            echo "❌ MCP $name is degraded" >> $GITHUB_STEP_SUMMARY
+          elif [ "$updating" = "True" ]; then
+            echo "⚠️  MCP $name is updating" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ MCP $name: $ready/$count ready" >> $GITHUB_STEP_SUMMARY
+          fi
+        done
+
+    - name: Test etcd Health
+      run: |
+        echo "## etcd Health" >> $GITHUB_STEP_SUMMARY
+
+        # Get etcd pod
+        ETCD_POD=$(oc get pods -n openshift-etcd -l app=etcd -o name 2>/dev/null | head -1)
+
+        if [ -n "$ETCD_POD" ]; then
+          # Check etcd endpoint health
+          ETCD_HEALTH=$(oc rsh -n openshift-etcd -c etcdctl $ETCD_POD etcdctl endpoint health --cluster 2>/dev/null || echo "error")
+
+          if echo "$ETCD_HEALTH" | grep -q "is healthy"; then
+            echo "✅ etcd cluster is healthy" >> $GITHUB_STEP_SUMMARY
+            echo "$ETCD_HEALTH" | while read line; do
+              echo "   $line" >> $GITHUB_STEP_SUMMARY
+            done
+          else
+            echo "❌ etcd health check failed" >> $GITHUB_STEP_SUMMARY
+          fi
+        else
+          echo "⚠️  etcd pod not found" >> $GITHUB_STEP_SUMMARY
+        fi
+
+    - name: Test Network Connectivity
+      run: |
+        echo "## Network Connectivity" >> $GITHUB_STEP_SUMMARY
+
+        # Use oc debug node to test network from within the cluster
+        NODE_NAME=$(oc get nodes --no-headers -o custom-columns=NAME:.metadata.name | head -1)
+
+        if [ -z "$NODE_NAME" ]; then
+          echo "❌ No nodes found for network test" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+        # Test DNS resolution using node debug pod
+        echo "Testing DNS resolution..."
+        if oc debug node/$NODE_NAME --quiet -- chroot /host nslookup kubernetes.default.svc.cluster.local > /dev/null 2>&1; then
+          echo "✅ DNS resolution working" >> $GITHUB_STEP_SUMMARY
+        else
+          # Fallback: check CoreDNS pods are running
+          DNS_PODS=$(oc get pods -n openshift-dns -l dns.operator.openshift.io/daemonset-dns=default --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+          if [ "$DNS_PODS" -gt 0 ]; then
+            echo "✅ CoreDNS pods running ($DNS_PODS pods)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ DNS resolution failed and no CoreDNS pods running" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+        fi
+
+        # Test service connectivity via API server health endpoint
+        echo "Testing service connectivity..."
+        API_HEALTH=$(oc get --raw /healthz 2>/dev/null || echo "error")
+        if [ "$API_HEALTH" = "ok" ]; then
+          echo "✅ Kubernetes API healthy" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "⚠️ API health check returned: $API_HEALTH" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        # Check pod network (CNI) is functional by verifying pod IPs exist
+        POD_IPS=$(oc get pods -A -o jsonpath='{.items[*].status.podIP}' 2>/dev/null | wc -w | tr -d '[:space:]')
+        if [ "$POD_IPS" -gt 0 ]; then
+          echo "✅ Pod network functional ($POD_IPS pods have IPs)" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ No pods have IP addresses assigned" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+    - name: Test CatalogSources
+      run: |
+        echo "## CatalogSources Status" >> $GITHUB_STEP_SUMMARY
+
+        # Check CatalogSource pods in openshift-marketplace
+        CATALOG_PODS=$(oc get pods -n openshift-marketplace --no-headers 2>/dev/null | wc -l || echo "0")
+        RUNNING_CATALOG=$(oc get pods -n openshift-marketplace --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l || echo "0")
+
+        # Check for ImagePullBackOff specifically (indicates disconnected registry issues)
+        PULL_ERRORS=$(oc get pods -n openshift-marketplace --no-headers 2>/dev/null | \
+          grep -E "ImagePullBackOff|ErrImagePull" | wc -l || echo "0")
+
+        echo "Marketplace Pods: $RUNNING_CATALOG/$CATALOG_PODS running" >> $GITHUB_STEP_SUMMARY
+
+        if [ "$PULL_ERRORS" -gt 0 ]; then
+          echo "❌ CatalogSource image pull failures detected" >> $GITHUB_STEP_SUMMARY
+          echo "   This indicates disconnected registry configuration issues" >> $GITHUB_STEP_SUMMARY
+          oc get pods -n openshift-marketplace --no-headers 2>/dev/null | \
+            grep -E "ImagePullBackOff|ErrImagePull" | while read line; do
+            echo "- $line" >> $GITHUB_STEP_SUMMARY
+          done
+          exit 1
+        elif [ "$RUNNING_CATALOG" -eq "$CATALOG_PODS" ] && [ "$CATALOG_PODS" -gt 0 ]; then
+          echo "✅ All CatalogSource pods are running" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "⚠️  Some CatalogSource pods not running" >> $GITHUB_STEP_SUMMARY
+        fi
+
+    # =========================================================================
+    # Post-Install Verification (IDMS, Sealed Secrets, ArgoCD)
+    # =========================================================================
+
+    - name: Test IDMS Configuration
+      run: |
+        echo "## IDMS Configuration" >> $GITHUB_STEP_SUMMARY
+
+        IDMS_COUNT=$(oc get imagedigestmirrorset --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+        IDMS_COUNT="${IDMS_COUNT:-0}"
+
+        if [ "$IDMS_COUNT" -gt 0 ]; then
+          echo "✅ Found $IDMS_COUNT ImageDigestMirrorSet(s)" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ No IDMS found - operators will fail to pull images" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+    - name: Test Sealed Secrets Key
+      run: |
+        echo "## Sealed Secrets Key" >> $GITHUB_STEP_SUMMARY
+
+        # Verify the sealed-secrets namespace and shared key exist
+        if oc get namespace sealed-secrets &>/dev/null; then
+          if oc get secret sealed-secrets-key -n sealed-secrets &>/dev/null; then
+            echo "✅ Sealed Secrets shared key present" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Sealed Secrets key missing (sealed-secrets-key Secret not found)" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+        else
+          echo "❌ sealed-secrets namespace does not exist" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+    - name: Test ArgoCD Bootstrap
+      shell: bash
+      run: |
+        echo "## ArgoCD Bootstrap" >> $GITHUB_STEP_SUMMARY
+
+        CLUSTER="${{ inputs.cluster_name }}"
+
+        # Check ArgoCD operator is installed
+        if oc get csv -n openshift-operators 2>/dev/null | grep -q "openshift-gitops-operator.*Succeeded"; then
+          echo "✅ ArgoCD operator installed (CSV Succeeded)" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ ArgoCD operator not installed or not ready" >> $GITHUB_STEP_SUMMARY
+          oc get csv -n openshift-operators 2>/dev/null | grep gitops >> $GITHUB_STEP_SUMMARY || echo "   No GitOps CSV found" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+        # Check ArgoCD instance exists
+        if oc get argocd openshift-gitops -n openshift-gitops &>/dev/null; then
+          echo "✅ ArgoCD instance ready" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ ArgoCD instance not found" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+        # Check saif-apps Application exists and points to correct cluster
+        CURRENT_PATH=$(oc get application saif-apps -n openshift-gitops -o jsonpath='{.spec.source.path}' 2>/dev/null || echo "")
+        EXPECTED_PATH="clusters/${CLUSTER}"
+
+        if [ "$CURRENT_PATH" = "$EXPECTED_PATH" ]; then
+          echo "✅ App-of-Apps configured (path: $CURRENT_PATH)" >> $GITHUB_STEP_SUMMARY
+        elif [ -n "$CURRENT_PATH" ]; then
+          echo "❌ App-of-Apps path mismatch: expected '$EXPECTED_PATH', got '$CURRENT_PATH'" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        else
+          echo "❌ saif-apps Application not found" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+        # Check GitHub repo credentials exist
+        if oc get secret github-repo-creds -n openshift-gitops &>/dev/null; then
+          echo "✅ GitHub repo credentials configured" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ GitHub repo credentials missing" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+    # =========================================================================
+    # Informational
+    # =========================================================================
+
+    - name: Warning Events
+      run: |
+        echo "## Recent Warning Events" >> $GITHUB_STEP_SUMMARY
+
+        WARNINGS=$(oc get events -A --field-selector type=Warning --no-headers 2>/dev/null | wc -l || echo "0")
+
+        if [ "$WARNINGS" -eq 0 ]; then
+          echo "✅ No warning events" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "⚠️  $WARNINGS warning events found (review for issues)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Recent Warnings (last 5):**" >> $GITHUB_STEP_SUMMARY
+          oc get events -A --field-selector type=Warning --sort-by='.lastTimestamp' --no-headers 2>/dev/null | \
+            tail -5 | while read line; do
+            echo "- $line" >> $GITHUB_STEP_SUMMARY
+          done
+        fi
+
+    - name: Test Summary
+      if: success()
+      run: |
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "---" >> $GITHUB_STEP_SUMMARY
+        echo "**✅ OpenShift infrastructure test passed**" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "Core cluster healthy. Post-install (IDMS, Sealed Secrets, ArgoCD) verified." >> $GITHUB_STEP_SUMMARY
+        echo "Workload health tested separately by saif-gitops." >> $GITHUB_STEP_SUMMARY

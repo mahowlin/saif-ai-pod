@@ -1,0 +1,22 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+# Shared Sealed Secrets Key - Injected during bootstrap
+# This secret contains the TLS key pair used to decrypt SealedSecrets
+# The same key is deployed to all clusters for consistent decryption
+#
+# IMPORTANT: ${SEALED_SECRETS_CERT} and ${SEALED_SECRETS_KEY} are substituted
+# by envsubst during workflow execution
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sealed-secrets-key
+  namespace: sealed-secrets
+  labels:
+    sealedsecrets.bitnami.com/sealed-secrets-key: active
+    app.kubernetes.io/name: sealed-secrets
+type: kubernetes.io/tls
+data:
+  tls.crt: ${SEALED_SECRETS_CERT}
+  tls.key: ${SEALED_SECRETS_KEY}

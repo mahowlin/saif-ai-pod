@@ -1,0 +1,119 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+#
+# This software is licensed to you under the terms of the Cisco Sample
+# Code License, Version 1.1 (the "License"). You may obtain a copy of the
+# License at
+#
+#                https://developer.cisco.com/docs/licenses
+#
+# All use of the material herein must be in accordance with the terms of
+# the License. All rights not expressly granted by the License are
+# reserved. Unless required by applicable law or agreed to separately in
+# writing, software distributed under the License is distributed on an "AS
+# IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied.
+
+# mdadm RAID10 configuration for NVMe data drives
+#
+# Architecture:
+# - Late-boot array creation (After=multi-user.target) to avoid hardware init races
+# - Bounded wait loop for device availability (180s max)
+# - Restart=on-failure for transient device delays
+# - Failure marker to gate LVMS deployment
+# - Standard mdadm/udev auto-assembly on subsequent reboots
+#
+# NOTE: Uses contents.source with base64 data URLs (raw Ignition format)
+# This is required for Day 1 MCC bootstrap which does NOT convert contents.inline
+{% if nvme_disks_b64 is defined %}
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 99-mdadm-nvme-raid10
+  labels:
+    machineconfiguration.openshift.io/role: master
+spec:
+  config:
+    ignition:
+      version: 3.2.0
+    storage:
+      files:
+        - path: /etc/mdadm/nvme-disks.list
+          mode: 0644
+          overwrite: false
+          contents:
+            source: "data:text/plain;charset=utf-8;base64,{{ nvme_disks_b64 }}"
+
+        - path: /etc/mdadm/mdadm-create-nvme.sh
+          mode: 0755
+          overwrite: false
+          contents:
+            source: "data:text/plain;charset=utf-8;base64,{{ create_script_b64 }}"
+
+        - path: /etc/mdadm/mdadm-assemble-nvme.sh
+          mode: 0755
+          overwrite: false
+          contents:
+            source: "data:text/plain;charset=utf-8;base64,{{ assemble_script_b64 }}"
+
+    systemd:
+      units:
+        - name: mdadm-create-nvme.service
+          enabled: true
+          contents: |
+            [Unit]
+            Description=Create NVMe RAID10 array (one-time)
+            After=multi-user.target
+            ConditionPathExists=!/var/lib/mdadm/nvme-data.created
+            ConditionPathExists=/etc/mdadm/nvme-disks.list
+            StartLimitIntervalSec=300
+            StartLimitBurst=5
+
+            [Service]
+            Type=oneshot
+            ExecStart=/bin/bash /etc/mdadm/mdadm-create-nvme.sh
+            RemainAfterExit=yes
+            Restart=on-failure
+            RestartSec=30
+
+            [Install]
+            WantedBy=multi-user.target
+
+        - name: mdadm-assemble-nvme.service
+          enabled: true
+          contents: |
+            [Unit]
+            Description=Fallback NVMe RAID assembly
+            After=multi-user.target
+            ConditionPathExists=/var/lib/mdadm/nvme-data.created
+            ConditionPathExists=/etc/mdadm.conf
+
+            [Service]
+            Type=oneshot
+            ExecStart=/bin/bash /etc/mdadm/mdadm-assemble-nvme.sh
+            RemainAfterExit=yes
+
+            [Install]
+            WantedBy=multi-user.target
+
+        - name: mdadm-monitor.service
+          enabled: true
+          contents: |
+            [Unit]
+            Description=mdadm array monitor
+            After=multi-user.target
+            After=mdadm-create-nvme.service
+            After=mdadm-assemble-nvme.service
+
+            [Service]
+            Type=simple
+            ExecStart=/usr/sbin/mdadm --monitor --scan --syslog --daemonise=no
+            Restart=always
+            RestartSec=10
+
+            [Install]
+            WantedBy=multi-user.target
+{% else %}
+# WARNING: nvme_serials not defined or incomplete for {{ cluster.name }}
+# This cluster will not have mdadm RAID configured
+# Expected 5 NVMe serial numbers in ucs-state.yaml
+{% endif %}

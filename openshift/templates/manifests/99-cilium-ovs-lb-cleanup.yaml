@@ -1,0 +1,60 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+#
+# This software is licensed to you under the terms of the Cisco Sample
+# Code License, Version 1.1 (the "License"). You may obtain a copy of the
+# License at
+#
+#                https://developer.cisco.com/docs/licenses
+#
+# All use of the material herein must be in accordance with the terms of
+# the License. All rights not expressly granted by the License are
+# reserved. Unless required by applicable law or agreed to separately in
+# writing, software distributed under the License is distributed on an "AS
+# IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied.
+
+# Clean up OVS LoadBalancer flows for Cilium compatibility
+#
+# OCP 4.19 enables BareMetalLoadBalancer by default, which creates OVS flows
+# (priority=110) in br-ex that compete with Cilium for LoadBalancer traffic.
+# These flows are created once at boot and do NOT continuously reconcile.
+#
+# This MachineConfig runs a oneshot service after boot that deletes the
+# offending flows by cookie. Once deleted, they stay deleted and Cilium
+# handles LoadBalancer correctly.
+#
+# Note: We cannot use FeatureGate CustomNoUpgrade via install-config because
+# the Agent-Based Installer doesn't support featureSet configuration.
+#
+# Reference: GITOPS_DAY2_REMEDIATION.md OVS flow investigation (2026-02-02)
+
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 99-cilium-ovs-lb-cleanup
+  labels:
+    machineconfiguration.openshift.io/role: master
+spec:
+  config:
+    ignition:
+      version: 3.4.0
+    systemd:
+      units:
+        - name: cilium-ovs-lb-cleanup.service
+          enabled: true
+          contents: |
+            [Unit]
+            Description=Clean OVS LoadBalancer flows for Cilium
+            After=ovs-vswitchd.service network.target
+            Wants=ovs-vswitchd.service
+
+            [Service]
+            Type=oneshot
+            # Wait for OVS flows to be created (they appear ~4 min after boot)
+            ExecStartPre=/bin/sleep 300
+            # Delete priority=110 flows by cookie (must use cookie, not priority)
+            ExecStart=/bin/bash -c 'for cookie in $(ovs-ofctl dump-flows br-ex 2>/dev/null | grep priority=110 | sed -n "s/.*cookie=\\([^,]*\\).*/\\1/p" | sort -u); do ovs-ofctl del-flows br-ex cookie=$cookie/-1 2>/dev/null && echo "Deleted flows with cookie $cookie"; done'
+            RemainAfterExit=yes
+
+            [Install]
+            WantedBy=multi-user.target

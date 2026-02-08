@@ -1,0 +1,113 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+#
+# This software is licensed to you under the terms of the Cisco Sample
+# Code License, Version 1.1 (the "License"). You may obtain a copy of the
+# License at
+#
+#                https://developer.cisco.com/docs/licenses
+#
+# All use of the material herein must be in accordance with the terms of
+# the License. All rights not expressly granted by the License are
+# reserved. Unless required by applicable law or agreed to separately in
+# writing, software distributed under the License is distributed on an "AS
+# IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied.
+
+#------------------------------------------------------------------------------
+# OpenShift Install Configuration - SNO (Single Node OpenShift)
+#------------------------------------------------------------------------------
+# Generated from template by render-cluster-config.py
+# Cluster: {{ cluster.name }}
+#------------------------------------------------------------------------------
+
+apiVersion: v1
+metadata:
+  name: {{ cluster.name }}
+baseDomain: {{ infrastructure.base_domain }}
+
+#------------------------------------------------------------------------------
+# Compute Configuration - SNO has no workers
+#------------------------------------------------------------------------------
+compute:
+  - name: worker
+    replicas: 0  # SNO - no worker nodes
+
+#------------------------------------------------------------------------------
+# Control Plane Configuration
+#------------------------------------------------------------------------------
+controlPlane:
+  name: master
+  replicas: 1  # SNO - single control plane node
+  platform: {}
+
+#------------------------------------------------------------------------------
+# Networking Configuration - Using Cilium CNI
+#------------------------------------------------------------------------------
+networking:
+  # Must use OVNKubernetes for SNO install, Cilium Day 1 manifests will replace it
+  networkType: OVNKubernetes
+
+  clusterNetwork:
+    - cidr: {{ infrastructure.cluster_network.cidr }}
+      hostPrefix: {{ infrastructure.cluster_network.host_prefix }}
+
+  serviceNetwork:
+{% for network in infrastructure.service_network %}
+    - {{ network }}
+{% endfor %}
+
+  machineNetwork:
+    - cidr: {{ infrastructure.network_cidr }}  # VLAN {{ infrastructure.vlan }} network CIDR
+
+#------------------------------------------------------------------------------
+# Platform Configuration
+#------------------------------------------------------------------------------
+platform:
+  none: {}  # Bare metal / Agent-based install
+
+#------------------------------------------------------------------------------
+# Image Digest Sources - Air-Gap Mirror Configuration
+#------------------------------------------------------------------------------
+# Note: imageContentSources is deprecated in OCP 4.14+, use imageDigestSources
+imageDigestSources:
+{% for ics in infrastructure.image_content_sources %}
+  - mirrors:
+{% for mirror in ics.mirrors %}
+      - {{ mirror }}
+{% endfor %}
+    source: {{ ics.source }}
+{% endfor %}
+
+#------------------------------------------------------------------------------
+# Credentials - Injected via renderer or placeholders for git
+#------------------------------------------------------------------------------
+
+# Your Red Hat pull secret - get from https://console.redhat.com/openshift/install/pull-secret
+# Combine with local registry credentials for air-gapped deployment
+pullSecret: '{{ pull_secret | default("PLACEHOLDER") }}'
+
+# Your SSH public key for accessing nodes
+sshKey: '{{ ssh_key | default("PLACEHOLDER") }}'
+
+#------------------------------------------------------------------------------
+# Additional Configuration
+#------------------------------------------------------------------------------
+
+# Proxy settings (uncomment if needed)
+# proxy:
+#   httpProxy: http://proxy.example.com:8080
+#   httpsProxy: http://proxy.example.com:8080
+#   noProxy: .{{ infrastructure.base_domain }},{{ infrastructure.network_cidr }},{{ infrastructure.service_network[0] }},{{ infrastructure.cluster_network.cidr }}
+
+# Additional trust bundle for custom CA (registry TLS certificate)
+# additionalTrustBundlePolicy must be "Always" when no proxy is configured,
+# otherwise the trust bundle is ignored (default is "Proxyonly")
+{% if additional_trust_bundle %}
+additionalTrustBundlePolicy: Always
+
+additionalTrustBundle: |
+{{ additional_trust_bundle | indent(2, first=True) }}
+{% endif %}
+
+# FIPS mode (uncomment to enable)
+# fips: true

@@ -1,0 +1,159 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+#
+# This software is licensed to you under the terms of the Cisco Sample
+# Code License, Version 1.1 (the "License"). You may obtain a copy of the
+# License at
+#
+#                https://developer.cisco.com/docs/licenses
+#
+# All use of the material herein must be in accordance with the terms of
+# the License. All rights not expressly granted by the License are
+# reserved. Unless required by applicable law or agreed to separately in
+# writing, software distributed under the License is distributed on an "AS
+# IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied.
+
+---
+#========================================
+#   SAIF AI Pod Compute & Management Policies
+#   Naming convention: saif-ai-pod-{policy-type}
+#========================================
+cpa-infra:
+  policies:
+    #----------------------------------------
+    # BIOS Policy - Standard (no GPU)
+    #----------------------------------------
+    bios:
+      - name: saif-ai-pod-bios
+        description: "AI Pod BIOS policy - standard (no GPU)"
+        bios_settings:
+          ProcessorC6report: enabled
+          WorkLoadConfig: Balanced
+
+      #----------------------------------------
+      # BIOS Policy - GPU Enabled (L40S)
+      # For servers with NVIDIA L40S GPU (ai-pod-1, ai-pod-2)
+      # Key settings: Above 4G decoding, NUMA optimization
+      #----------------------------------------
+      - name: saif-ai-pod-bios-gpu
+        description: "AI Pod BIOS policy - GPU enabled (L40S)"
+        bios_settings:
+          # Base settings
+          ProcessorC6report: enabled
+          WorkLoadConfig: Balanced
+          # GPU enablement - CRITICAL for L40S visibility
+          memory_mapped_io_above4gb: enabled    # Required for large GPU BAR
+          numa_optimized: enabled               # Better GPU performance
+
+    #----------------------------------------
+    # Boot Order Policy - M.2 RAID primary, CIMC DVD secondary
+    #----------------------------------------
+    boot_order:
+      - name: saif-ai-pod-boot
+        description: "AI Pod boot order - M.2 RAID primary, CIMC DVD secondary"
+        boot_mode: Uefi
+        enable_secure_boot: false
+        boot_devices:
+          - device_name: disk
+            device_type: local_disk
+            enabled: true
+            slot: MSTOR-RAID
+          - device_name: CIMC-DVD
+            device_type: virtual_media
+            enabled: true
+            subtype: cimc-mapped-dvd
+
+    #----------------------------------------
+    # Storage Policy - M.2 RAID (for servers with 2 M.2 disks)
+    #----------------------------------------
+    storage:
+      - name: saif-ai-pod-storage
+        description: "AI Pod storage policy - M.2 RAID boot"
+        m2_raid_configuration:
+          slot: MSTOR-RAID-1
+          name: MStorBootVd
+        unused_disks_state: NoChange
+        use_jbod_for_vd_creation: false
+
+      #----------------------------------------
+      # Storage Policy - No RAID (for servers with 1 M.2 disk)
+      #----------------------------------------
+      - name: saif-ai-pod-storage-noraid
+        description: "AI Pod storage policy - Single M.2 disk (no RAID)"
+        unused_disks_state: NoChange
+        use_jbod_for_vd_creation: false
+
+      #----------------------------------------
+      # Storage Policy - M.2 RAID + NVMe JBOD (for ai-pod-2, ai-pod-3)
+      # Exposes NVMe drives as individual disks for mdadm RAID
+      #----------------------------------------
+      - name: saif-ai-pod-storage-nvme-jbod
+        description: "AI Pod storage - M.2 RAID boot + NVMe JBOD for data"
+        m2_raid_configuration:
+          slot: MSTOR-RAID-1
+          name: MStorBootVd
+        unused_disks_state: Jbod
+        use_jbod_for_vd_creation: true
+
+      #----------------------------------------
+      # Storage Policy - Single M.2 + NVMe JBOD (for ai-pod-1, ai-pod-4)
+      # Exposes NVMe drives as individual disks for mdadm RAID
+      #----------------------------------------
+      - name: saif-ai-pod-storage-nvme-jbod-noraid
+        description: "AI Pod storage - Single M.2 boot + NVMe JBOD for data"
+        unused_disks_state: Jbod
+        use_jbod_for_vd_creation: true
+
+    #----------------------------------------
+    # IMC Access Policy - Inband VLAN 134, OOB enabled
+    #----------------------------------------
+    imc_access:
+      - name: saif-ai-pod-imc-access
+        description: "AI Pod IMC access - inband VLAN 134"
+        inband_ip_pool: saif-ai-pod-inband-ip-pool
+        inband_vlan_id: 134
+        ipv4_address_configuration: true
+        ipv6_address_configuration: false
+        out_of_band_ip_pool: saif-ai-pod-oob-ip-pool
+
+    #----------------------------------------
+    # Local User Policy - Admin user, password via env var
+    #----------------------------------------
+    local_user:
+      - name: saif-ai-pod-local-user
+        description: "AI Pod local user - admin only, password expiry disabled"
+        password_properties:
+          enable_password_expiry: false
+          enforce_strong_password: false
+          always_send_user_password: false
+          grace_period: 0
+          notification_period: 15
+          password_expiry_duration: 90
+          password_history: 5
+        users:
+          - username: admin
+            role: admin
+            enabled: true
+            password: 1
+
+    #----------------------------------------
+    # Virtual KVM Policy - Enabled with encryption
+    #----------------------------------------
+    virtual_kvm:
+      - name: saif-ai-pod-vkvm
+        description: "AI Pod virtual KVM - enabled with encryption"
+        enabled: true
+        enable_local_server_video: true
+        enable_video_encryption: true
+        maximum_sessions: 4
+        remote_port: 2068
+        tunneled_kvm_enabled: true
+    #----------------------------------------
+    # Scrub Policy - Disk scrub enabled
+    #----------------------------------------
+    scrub:
+      - name: saif-ai-pod-scrub
+        description: "AI Pod scrub policy - disk scrub enabled"
+        disk_scrub: true
+        bios_scrub: false
+        flexflash_scrub: false

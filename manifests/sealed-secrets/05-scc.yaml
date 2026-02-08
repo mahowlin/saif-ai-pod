@@ -1,0 +1,47 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+# Sealed Secrets SCC - allows running with fsGroup 65534 and seccomp profile
+# Required for OpenShift: restricted-v2 SCC rejects fsGroup 65534
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: sealed-secrets-controller
+  annotations:
+    kubernetes.io/description: >-
+      Custom SCC for Sealed Secrets controller. Allows running with fsGroup 65534
+      and explicit seccomp profiles (RuntimeDefault). Based on restricted-v2.
+allowHostDirVolumePlugin: false
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPID: false
+allowHostPorts: false
+allowPrivilegeEscalation: false
+allowPrivilegedContainer: false
+allowedCapabilities: null
+defaultAddCapabilities: null
+fsGroup:
+  type: RunAsAny
+groups: []
+priority: 10
+readOnlyRootFilesystem: true
+requiredDropCapabilities:
+- ALL
+runAsUser:
+  type: MustRunAsNonRoot
+seLinuxContext:
+  type: MustRunAs
+seccompProfiles:
+- RuntimeDefault
+- runtime/default
+supplementalGroups:
+  type: RunAsAny
+users:
+- system:serviceaccount:sealed-secrets:sealed-secrets-controller
+volumes:
+- configMap
+- downwardAPI
+- emptyDir
+- projected
+- secret

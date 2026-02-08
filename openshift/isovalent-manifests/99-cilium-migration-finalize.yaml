@@ -1,0 +1,112 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+#
+# This software is licensed to you under the terms of the Cisco Sample
+# Code License, Version 1.1 (the "License"). You may obtain a copy of the
+# License at
+#
+#                https://developer.cisco.com/docs/licenses
+#
+# All use of the material herein must be in accordance with the terms of
+# the License. All rights not expressly granted by the License are
+# reserved. Unless required by applicable law or agreed to separately in
+# writing, software distributed under the License is distributed on an "AS
+# IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied.
+
+# Cilium Migration Finalization MachineConfig for SNO Day 1 Deployment
+#
+# Problem: Day 1 manifests deploy Cilium, but network.config still shows OVNKubernetes.
+#          CNO will revert Cilium config unless we properly migrate the network config.
+#
+# Solution: After Cilium is healthy, run migration script to:
+#           1. Mask reboot (prevent MCO from rebooting during migration)
+#           2. Disable CNO (CVO override + scale to 0)
+#           3. Patch network.config to Cilium type + CIDR
+#           4. Patch network.operator: remove ovnKubernetesConfig (JSON patch),
+#              set Cilium type + CIDR (merge patch)
+#           5. Delete applied-cluster configmap (MUST be after patches, before CNO restart)
+#           6. Re-enable CNO (rebuilds applied-cluster from patched state)
+#           7. Create marker file
+#           8. Delete OVN namespace (non-blocking) + unmask reboot
+#
+# Critical ordering: applied-cluster must be deleted AFTER network.operator is patched
+# but BEFORE CNO restarts. If deleted before patching, CNO recreates it with old OVN
+# state on startup and rejects the Cilium config as "unsafe change."
+#
+# Resilience: Steps 1-7 take ~2 seconds. Marker is created before namespace delete
+#             so MCO reboot cannot cause a redundant re-run.
+#
+# Dependencies: 99-cilium-reboot-guard.yaml must also be applied (prevents reboot during migration)
+#
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 99-cilium-migration-finalize
+  labels:
+    machineconfiguration.openshift.io/role: master
+spec:
+  config:
+    ignition:
+      version: 3.2.0
+    systemd:
+      units:
+        - name: cilium-migration-finalize.service
+          enabled: true
+          contents: |
+            [Unit]
+            Description=Finalize Cilium migration after Day 1 deployment
+            After=kubelet.service cilium-reboot-guard.service
+            # Only run if reboot guard has completed (Cilium is healthy)
+            Requires=cilium-reboot-guard.service
+            # Don't run if already migrated
+            ConditionPathExists=!/var/lib/cilium-migration-complete
+
+            [Service]
+            Type=oneshot
+            Environment=KUBECONFIG=/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/localhost-recovery.kubeconfig
+            # Wait for API to be fully ready
+            ExecStartPre=/bin/bash -c '\
+              echo "Cilium Migration: Waiting for kubeconfig at $KUBECONFIG..."; \
+              until [ -s "$KUBECONFIG" ]; do \
+                sleep 10; \
+                echo "Cilium Migration: kubeconfig not ready, waiting..."; \
+              done; \
+              echo "Cilium Migration: kubeconfig present"; \
+              echo "Cilium Migration: Waiting for API server..."; \
+              until /usr/bin/oc get nodes 2>/dev/null; do \
+                sleep 10; \
+                echo "Cilium Migration: API not ready, waiting..."; \
+              done; \
+              echo "Cilium Migration: API ready"'
+            # Run migration script
+            ExecStart=/bin/bash -c '\
+              set -e; \
+              echo "Cilium Migration: Starting migration finalization..."; \
+              echo "Cilium Migration: Step 1/8 - Masking reboot (protect migration window)..."; \
+              /usr/bin/systemctl mask --now reboot.target systemd-reboot.service 2>/dev/null || true; \
+              echo "Cilium Migration: Step 2/8 - Disabling CNO (CVO override + scale to 0)..."; \
+              /usr/bin/oc patch clusterversion version --type=json -p '"'"'[{"op":"add","path":"/spec/overrides","value":[{"kind":"Deployment","group":"apps","name":"network-operator","namespace":"openshift-network-operator","unmanaged":true}]}]'"'"'; \
+              /usr/bin/oc scale deployment -n openshift-network-operator network-operator --replicas=0; \
+              echo "Cilium Migration: Step 3/8 - Patching network.config..."; \
+              /usr/bin/oc patch network.config cluster --type=merge -p '"'"'{"spec":{"clusterNetwork":[{"cidr":"10.253.0.0/16","hostPrefix":24}],"networkType":"Cilium"}}'"'"'; \
+              echo "Cilium Migration: Step 4/8 - Patching network.operator (JSON + merge)..."; \
+              /usr/bin/oc patch network.operator cluster --type=json -p '"'"'[{"op":"remove","path":"/spec/defaultNetwork/ovnKubernetesConfig"}]'"'"' 2>/dev/null || true; \
+              /usr/bin/oc patch network.operator cluster --type=merge -p '"'"'{"spec":{"clusterNetwork":[{"cidr":"10.253.0.0/16","hostPrefix":24}],"defaultNetwork":{"type":"Cilium"},"deployKubeProxy":false}}'"'"'; \
+              echo "Cilium Migration: Step 5/8 - Deleting applied-cluster (must happen AFTER patches, BEFORE CNO restart)..."; \
+              /usr/bin/oc delete configmap -n openshift-network-operator applied-cluster --ignore-not-found; \
+              echo "Cilium Migration: Step 6/8 - Re-enabling CNO (will rebuild applied-cluster from patched state)..."; \
+              /usr/bin/oc scale deployment -n openshift-network-operator network-operator --replicas=1; \
+              /usr/bin/oc patch clusterversion version --type=merge -p '"'"'{"spec":{"overrides":null}}'"'"'; \
+              echo "Cilium Migration: Step 7/8 - Creating migration marker..."; \
+              /bin/touch /var/lib/cilium-migration-complete; \
+              echo "Cilium Migration: Step 8/8 - Cleanup and unmask reboot..."; \
+              /usr/bin/oc delete namespace openshift-ovn-kubernetes --ignore-not-found --wait=false; \
+              /usr/bin/systemctl unmask reboot.target systemd-reboot.service 2>/dev/null || true; \
+              echo "Cilium Migration: Complete!"'
+            # Marker already created in step 6 (before namespace delete)
+            ExecStartPost=/bin/true
+            RemainAfterExit=yes
+            TimeoutStartSec=3600
+
+            [Install]
+            WantedBy=multi-user.target

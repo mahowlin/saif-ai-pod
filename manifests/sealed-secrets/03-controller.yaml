@@ -1,0 +1,85 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+# Licensed under the Cisco Sample Code License, Version 1.1
+# See LICENSE in the project root.
+
+# Sealed Secrets Controller Deployment
+# Image must be mirrored to local registry for disconnected environment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sealed-secrets-controller
+  namespace: sealed-secrets
+  labels:
+    app.kubernetes.io/name: sealed-secrets
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sealed-secrets
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sealed-secrets
+    spec:
+      serviceAccountName: sealed-secrets-controller
+      containers:
+        - name: controller
+          image: registry.example.com:5000/bitnami/sealed-secrets-controller:0.27.3
+          imagePullPolicy: IfNotPresent
+          args:
+            - --key-prefix=sealed-secrets-key
+            - --update-status
+          ports:
+            - containerPort: 8080
+              name: http
+            - containerPort: 8081
+              name: metrics
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+      securityContext:
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sealed-secrets-controller
+  namespace: sealed-secrets
+  labels:
+    app.kubernetes.io/name: sealed-secrets
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: http
+      name: http
+    - port: 8081
+      targetPort: metrics
+      name: metrics
+  selector:
+    app.kubernetes.io/name: sealed-secrets
