@@ -1,0 +1,86 @@
+#------------------------------------------------------------------------------
+# Agent Configuration — Compact 3-Node (Day 1 Cilium)
+#------------------------------------------------------------------------------
+# Generated from template by render-cluster-config.py --mode compact-day1
+# Cluster: {{ cluster.name }}
+#------------------------------------------------------------------------------
+# Key differences from SNO:
+#   - rendezvousIP: node-0 IP (bootstrap coordinator)
+#   - 3 host entries instead of 1
+#   - Same bond0 config per node, different IPs and MACs
+#------------------------------------------------------------------------------
+
+apiVersion: v1alpha1
+kind: AgentConfig
+metadata:
+  name: {{ cluster.name }}
+
+#------------------------------------------------------------------------------
+# Rendezvous IP — node-0 coordinates the bootstrap process
+#------------------------------------------------------------------------------
+rendezvousIP: {{ cluster.nodes[0].ip }}
+
+#------------------------------------------------------------------------------
+# Host Configuration — 3 nodes
+#------------------------------------------------------------------------------
+hosts:
+{% for node in cluster.nodes %}
+  #----------------------------------------------------------------------------
+  # {{ node.role_label | default("Node " + loop.index0|string) }} — {{ node.ucs_profile }}
+  #----------------------------------------------------------------------------
+  - hostname: {{ node.hostname }}
+    role: master
+
+    rootDeviceHints:
+      model: "{{ node.boot_disk_model }}"
+
+    interfaces:
+      - name: eth0
+        macAddress: {{ node.mac_eth0 }}
+      - name: eth1
+        macAddress: {{ node.mac_eth1 }}
+
+    networkConfig:
+      interfaces:
+        # Bond interface — active-backup for UCS dual-fabric failover
+        - name: bond0
+          type: bond
+          state: up
+          ipv4:
+            enabled: true
+            dhcp: false
+            address:
+              - ip: {{ node.ip }}
+                prefix-length: {{ infrastructure.prefix_length | default(24) }}
+          ipv6:
+            enabled: false
+          link-aggregation:
+            mode: active-backup
+            options:
+              miimon: '100'
+              primary: eth0
+            port:
+              - eth0
+              - eth1
+        - name: eth0
+          type: ethernet
+          state: up
+        - name: eth1
+          type: ethernet
+          state: up
+
+      dns-resolver:
+        config:
+          server:
+{% for dns in infrastructure.dns_servers %}
+            - {{ dns }}
+{% endfor %}
+
+      routes:
+        config:
+          - destination: 0.0.0.0/0
+            next-hop-address: {{ infrastructure.gateway }}
+            next-hop-interface: bond0
+            table-id: 254
+
+{% endfor %}

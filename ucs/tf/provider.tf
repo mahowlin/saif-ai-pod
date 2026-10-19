@@ -23,11 +23,11 @@ terraform {
   required_providers {
     intersight = {
       source  = "CiscoDevNet/intersight"
-      version = "1.0.64"
+      version = "1.0.78"
     }
     time = {
       source  = "time"
-      version = "0.9.1"
+      version = "0.13.1"
     }
     utils = {
       source  = "netascode/utils"

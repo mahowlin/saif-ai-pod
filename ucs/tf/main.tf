@@ -25,11 +25,12 @@
 #_________________________________________________________________________________________
 data "utils_yaml_merge" "model" {
   input = concat(
-    [for file in fileset("${path.module}/../config", "*.ezi.yaml") : file("${path.module}/../config/${file}")],
-    [for file in fileset("${path.module}/../config", "policies/*.ezi.yaml") : file("${path.module}/../config/${file}")],
-    [for file in fileset("${path.module}/../config/templates", "*.ezi.yaml") : file("${path.module}/../config/templates/${file}")],
-    [for file in fileset("${path.module}/../config/profiles", "*.ezi.yaml") : file("${path.module}/../config/profiles/${file}")],
-    [for file in fileset("${path.module}/../config/profiles/active", "*.ezi.yaml") : file("${path.module}/../config/profiles/active/${file}")]
+    [for file in fileset("${path.module}/../defaults", "*.ezi.yaml") : file("${path.module}/../defaults/${file}")],
+    [for file in fileset("${path.module}/../defaults", "policies/*.ezi.yaml") : file("${path.module}/../defaults/${file}")],
+    [for file in fileset("${path.module}/../defaults/templates", "*.ezi.yaml") : file("${path.module}/../defaults/templates/${file}")],
+    [for file in fileset("${path.module}/../defaults/profiles", "*.ezi.yaml") : file("${path.module}/../defaults/profiles/${file}")],
+    [for file in fileset("${path.module}/../defaults/profiles/active", "*.ezi.yaml") : file("${path.module}/../defaults/profiles/active/${file}")],
+    [for file in fileset("${path.module}/../../data/ucs", "*.ezi.yaml") : file("${path.module}/../../data/ucs/${file}")]
   )
   merge_list_items = false
 }

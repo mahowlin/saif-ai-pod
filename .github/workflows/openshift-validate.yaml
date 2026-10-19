@@ -15,130 +15,310 @@
 
 name: 'Validate OpenShift'
 
-# Validates OpenShift data model and pre-checks:
-# - cluster-macs.yaml and rendered configs
+# Validates SAIF-generated OCP artifacts and infrastructure pre-checks:
+# - data/openshift/<cluster>/ artifacts (install-config, agent-config, metadata)
+# - live UCS/Intersight hardware facts (MACs, boot disk hints)
 # - GitHub secrets, DNS, registry, web server
 
 on:
   workflow_dispatch:
     inputs:
       cluster_name:
-        description: 'Target cluster'
+        description: 'Target cluster (e.g. example-node-1, example-management)'
         required: true
+        type: string
+      cni_type:
+        description: 'CNI type to validate'
+        required: false
         type: choice
         options:
-          - ai-pod-1
-          - ai-pod-2
-          - ai-pod-3
-          - ai-pod-4
+          - Cilium
+          - OVN
+        default: 'Cilium'
   workflow_call:
     inputs:
       cluster_name:
         type: string
         required: true
+      cni_type:
+        type: string
+        required: false
+        default: 'Cilium'
 
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   validate:
-    name: 'Validate OpenShift Data Model'
-    runs-on: [self-hosted, linux, saif-github-runner]
+    name: 'Validate OpenShift'
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     container:
-      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
 
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
-    - name: Validate Data Model
+    - name: Validate Generated Artifacts
       run: |
-        echo "## Data Model Validation" >> $GITHUB_STEP_SUMMARY
+        echo "## Generated Artifacts" >> $GITHUB_STEP_SUMMARY
         VALIDATION_FAILED=0
         CLUSTER="${{ inputs.cluster_name }}"
+        DATA_DIR="data/openshift/${CLUSTER}"
 
-        # Check ucs-state.yaml exists (required for actual deployment)
-        if [ ! -f "ucs-state.yaml" ]; then
-          echo "⚠️  ucs-state.yaml not found (required for DEPLOY)" >> $GITHUB_STEP_SUMMARY
-          echo "   Run: gh workflow run ucs-pipeline.yaml" >> $GITHUB_STEP_SUMMARY
-        else
-          echo "✅ ucs-state.yaml exists" >> $GITHUB_STEP_SUMMARY
-
-          # Get UCS profile from cluster-mappings
-          UCS_PROFILE=$(yq -r ".clusters[] | select(.name == \"$CLUSTER\") | .ucs_profile" openshift/cluster-mappings.yaml)
-          INTERFACE=$(yq -r ".clusters[] | select(.name == \"$CLUSTER\") | .interface" openshift/cluster-mappings.yaml)
-
-          # Find profile in any chassis
-          CHASSIS_LIST=$(yq -r '.chassis | keys | .[]' ucs-state.yaml)
-          MAC_FOUND=false
-
-          for CHASSIS in $CHASSIS_LIST; do
-            # Note: Keys with dashes must be quoted for Python yq (interprets dashes as subtraction)
-            if yq -e ".chassis.\"$CHASSIS\".servers.\"$UCS_PROFILE\"" ucs-state.yaml > /dev/null 2>&1; then
-              # For bond interfaces, check both member MACs (eth0 and eth1)
-              # For single interfaces, check just that interface
-              if [ "$INTERFACE" = "bond0" ]; then
-                MAC_ETH0=$(yq -r ".chassis.\"$CHASSIS\".servers.\"$UCS_PROFILE\".mac_eth0" ucs-state.yaml)
-                MAC_ETH1=$(yq -r ".chassis.\"$CHASSIS\".servers.\"$UCS_PROFILE\".mac_eth1" ucs-state.yaml)
-                if [ "$MAC_ETH0" != "null" ] && [ -n "$MAC_ETH0" ] && [ "$MAC_ETH1" != "null" ] && [ -n "$MAC_ETH1" ]; then
-                  SERIAL=$(yq -r ".chassis.\"$CHASSIS\".servers.\"$UCS_PROFILE\".serial" ucs-state.yaml)
-                  SLOT=$(yq -r ".chassis.\"$CHASSIS\".servers.\"$UCS_PROFILE\".slot" ucs-state.yaml)
-                  echo "✅ MAC addresses for $INTERFACE: eth0=$MAC_ETH0, eth1=$MAC_ETH1" >> $GITHUB_STEP_SUMMARY
-                  echo "   Profile: $UCS_PROFILE (serial: $SERIAL, slot: $SLOT, chassis: $CHASSIS)" >> $GITHUB_STEP_SUMMARY
-                  MAC_FOUND=true
-                  break
-                fi
-              else
-                MAC=$(yq -r ".chassis.\"$CHASSIS\".servers.\"$UCS_PROFILE\".mac_${INTERFACE}" ucs-state.yaml)
-                if [ "$MAC" != "null" ] && [ -n "$MAC" ]; then
-                  SERIAL=$(yq -r ".chassis.\"$CHASSIS\".servers.\"$UCS_PROFILE\".serial" ucs-state.yaml)
-                  SLOT=$(yq -r ".chassis.\"$CHASSIS\".servers.\"$UCS_PROFILE\".slot" ucs-state.yaml)
-                  echo "✅ MAC address ($INTERFACE): $MAC" >> $GITHUB_STEP_SUMMARY
-                  echo "   Profile: $UCS_PROFILE (serial: $SERIAL, slot: $SLOT, chassis: $CHASSIS)" >> $GITHUB_STEP_SUMMARY
-                  MAC_FOUND=true
-                  break
-                fi
-              fi
-            fi
-          done
-
-          if [ "$MAC_FOUND" = false ]; then
-            echo "⚠️  MAC address not found for profile $UCS_PROFILE interface $INTERFACE (required for DEPLOY)" >> $GITHUB_STEP_SUMMARY
-          fi
-
-          # Validate NVMe serials exist for mdadm storage configuration (REQUIRED)
-          NVME_FOUND=false
-          for CHASSIS in $CHASSIS_LIST; do
-            if yq -e ".chassis.\"$CHASSIS\".servers.\"$UCS_PROFILE\"" ucs-state.yaml > /dev/null 2>&1; then
-              NVME_COUNT=$(yq -r ".chassis.\"$CHASSIS\".servers.\"$UCS_PROFILE\".nvme_serials | length // 0" ucs-state.yaml)
-              if [ "$NVME_COUNT" -eq 5 ]; then
-                echo "✅ NVMe serials: $NVME_COUNT drives (for mdadm RAID10)" >> $GITHUB_STEP_SUMMARY
-                NVME_FOUND=true
-              elif [ "$NVME_COUNT" -gt 0 ]; then
-                echo "❌ NVMe serials: $NVME_COUNT drives (expected 5 for RAID10)" >> $GITHUB_STEP_SUMMARY
-                VALIDATION_FAILED=1
-              else
-                echo "❌ NVMe serials: not found in ucs-state.yaml" >> $GITHUB_STEP_SUMMARY
-                echo "   Run UCS pipeline to discover: gh workflow run ucs-pipeline.yaml -f operation='Activate - Apply config to server' -f server_target=$UCS_PROFILE" >> $GITHUB_STEP_SUMMARY
-                VALIDATION_FAILED=1
-              fi
-              break
-            fi
-          done
-          if [ "$NVME_FOUND" = false ] && [ $VALIDATION_FAILED -eq 0 ]; then
-            echo "❌ NVMe serials: server profile $UCS_PROFILE not found in ucs-state.yaml" >> $GITHUB_STEP_SUMMARY
-            VALIDATION_FAILED=1
-          fi
+        # Check data directory exists
+        if [ ! -d "$DATA_DIR" ]; then
+          echo "❌ Cluster data directory not found: \`$DATA_DIR\`" >> $GITHUB_STEP_SUMMARY
+          echo "- SAIF renderer must transport artifacts here first." >> $GITHUB_STEP_SUMMARY
+          exit 1
         fi
 
-        # Note: Rendered configs are validated at deployment time
-        # The deploy workflow renders configs with secrets injected
-        # Pre-rendered configs in git are optional for review only
-        echo "ℹ️  Config rendering will be validated during deployment" >> $GITHUB_STEP_SUMMARY
+        # Check required files
+        for FILE in install-config.yaml agent-config.yaml metadata.yaml; do
+          if [ ! -f "$DATA_DIR/$FILE" ]; then
+            echo "❌ Missing: \`$DATA_DIR/$FILE\`" >> $GITHUB_STEP_SUMMARY
+            VALIDATION_FAILED=1
+          else
+            echo "✅ Found: \`$DATA_DIR/$FILE\`" >> $GITHUB_STEP_SUMMARY
+          fi
+        done
 
         if [ $VALIDATION_FAILED -eq 1 ]; then
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**❌ Data model validation FAILED**" >> $GITHUB_STEP_SUMMARY
+          echo "**❌ Required artifacts missing**" >> $GITHUB_STEP_SUMMARY
           exit 1
         fi
+
+        python3 scripts/enrich-cilium-day1-manifests.py \
+          --cluster-dir "$DATA_DIR" | tee /tmp/cilium-day1-enrichment.log
+        sed 's/^/  /' /tmp/cilium-day1-enrichment.log >> $GITHUB_STEP_SUMMARY
+
+        # Validate install-config content
+        INSTALL_CONFIG="$DATA_DIR/install-config.yaml"
+
+        CLUSTER_NAME=$(yq -r '.metadata.name' "$INSTALL_CONFIG")
+        echo "- Cluster name: \`$CLUSTER_NAME\`" >> $GITHUB_STEP_SUMMARY
+
+        NETWORK_TYPE=$(yq -r '.networking.networkType' "$INSTALL_CONFIG")
+        echo "- Network type: \`$NETWORK_TYPE\`" >> $GITHUB_STEP_SUMMARY
+
+        PLATFORM=$(yq -r '.platform | keys | .[0]' "$INSTALL_CONFIG")
+        echo "- Platform: \`$PLATFORM\`" >> $GITHUB_STEP_SUMMARY
+
+        CONTROL_REPLICAS=$(yq -r '.controlPlane.replicas' "$INSTALL_CONFIG")
+        echo "- Control plane replicas: \`$CONTROL_REPLICAS\`" >> $GITHUB_STEP_SUMMARY
+
+        BASE_DOMAIN=$(yq -r '.baseDomain' "$INSTALL_CONFIG")
+        echo "- Base domain: \`$BASE_DOMAIN\`" >> $GITHUB_STEP_SUMMARY
+
+        # Validate metadata and cross-file intent wiring.
+        METADATA="$DATA_DIR/metadata.yaml"
+        META_MODE=$(yq -r '.mode' "$METADATA")
+        META_VERSION=$(yq -r '.ocpVersion' "$METADATA")
+        META_NETWORK_TYPE=$(yq -r '.networkType' "$METADATA")
+        echo "- Mode: \`$META_MODE\`, OCP version: \`$META_VERSION\`" >> $GITHUB_STEP_SUMMARY
+
+        if ! echo "$META_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+          echo "❌ metadata.ocpVersion must pin an exact x.y.z release, got: \`$META_VERSION\`" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        else
+          echo "✅ metadata.ocpVersion is exact: \`$META_VERSION\`" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        if [ "$NETWORK_TYPE" != "$META_NETWORK_TYPE" ]; then
+          echo "❌ networkType mismatch: metadata=\`$META_NETWORK_TYPE\` install-config=\`$NETWORK_TYPE\`" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        else
+          echo "✅ metadata networkType matches install-config: \`$NETWORK_TYPE\`" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        EXPECTED_NETWORK_TYPE="OVNKubernetes"
+        if [ "${{ inputs.cni_type }}" = "Cilium" ]; then
+          EXPECTED_NETWORK_TYPE="Cilium"
+        fi
+
+        if [ "$NETWORK_TYPE" != "$EXPECTED_NETWORK_TYPE" ]; then
+          echo "❌ cni_type/input mismatch: input \`${{ inputs.cni_type }}\` expects install-config networkType \`$EXPECTED_NETWORK_TYPE\`, got \`$NETWORK_TYPE\`" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        else
+          echo "✅ cni_type input matches install-config networkType: \`$NETWORK_TYPE\`" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        if [ "$NETWORK_TYPE" = "Cilium" ]; then
+          MANIFEST_DIR="$DATA_DIR/manifests"
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Cilium Day 1 Manifest Validation" >> $GITHUB_STEP_SUMMARY
+
+          if [ ! -d "$MANIFEST_DIR" ]; then
+            echo "❌ Missing Cilium Day 1 manifest directory: \`$MANIFEST_DIR\`" >> $GITHUB_STEP_SUMMARY
+            echo "- IEP Agent-Based Installer flow requires prepared CLife manifests copied into \`./openshift/\` before \`openshift-install agent create image\`." >> $GITHUB_STEP_SUMMARY
+            VALIDATION_FAILED=1
+          else
+            REQUIRED_CILIUM_MANIFESTS="ciliumconfig.yaml v1_namespace_cilium.yaml apps_v1_deployment_clife-controller-manager.yaml"
+            for FILE in $REQUIRED_CILIUM_MANIFESTS; do
+              if [ -f "$MANIFEST_DIR/$FILE" ]; then
+                echo "✅ Found: \`$MANIFEST_DIR/$FILE\`" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "❌ Missing: \`$MANIFEST_DIR/$FILE\`" >> $GITHUB_STEP_SUMMARY
+                VALIDATION_FAILED=1
+              fi
+            done
+
+            CLIFE_RBAC_COUNT=$(ls "$MANIFEST_DIR"/rbac.authorization.k8s.io_v1_*clife*.yaml 2>/dev/null | wc -l | tr -d '[:space:]')
+            if [ "$CLIFE_RBAC_COUNT" -lt 1 ]; then
+              echo "❌ Missing CLife RBAC manifests in \`$MANIFEST_DIR\`" >> $GITHUB_STEP_SUMMARY
+              VALIDATION_FAILED=1
+            else
+              echo "✅ Found \`$CLIFE_RBAC_COUNT\` CLife RBAC manifest(s)" >> $GITHUB_STEP_SUMMARY
+            fi
+
+            CILIUM_CLUSTER_NAME=$(yq -r '.spec.cluster.name // ""' "$MANIFEST_DIR/ciliumconfig.yaml" 2>/dev/null || true)
+            if [ "$CILIUM_CLUSTER_NAME" != "$CLUSTER_NAME" ]; then
+              echo "❌ CiliumConfig cluster name mismatch: expected \`$CLUSTER_NAME\`, got \`${CILIUM_CLUSTER_NAME:-empty}\`" >> $GITHUB_STEP_SUMMARY
+              VALIDATION_FAILED=1
+            else
+              echo "✅ CiliumConfig cluster name matches: \`$CILIUM_CLUSTER_NAME\`" >> $GITHUB_STEP_SUMMARY
+            fi
+
+            CILIUM_POD_CIDR=$(yq -r '.spec.ipam.operator.clusterPoolIPv4PodCIDRList[0] // ""' "$MANIFEST_DIR/ciliumconfig.yaml" 2>/dev/null || true)
+            INSTALL_POD_CIDR=$(yq -r '.networking.clusterNetwork[0].cidr' "$INSTALL_CONFIG")
+            if [ "$CILIUM_POD_CIDR" != "$INSTALL_POD_CIDR" ]; then
+              echo "❌ CiliumConfig pod CIDR mismatch: install-config=\`$INSTALL_POD_CIDR\`, ciliumconfig=\`${CILIUM_POD_CIDR:-empty}\`" >> $GITHUB_STEP_SUMMARY
+              VALIDATION_FAILED=1
+            else
+              echo "✅ CiliumConfig pod CIDR matches install-config: \`$CILIUM_POD_CIDR\`" >> $GITHUB_STEP_SUMMARY
+            fi
+
+            CILIUM_CONF_PATH=$(yq -r '.spec.cni.confPath // ""' "$MANIFEST_DIR/ciliumconfig.yaml" 2>/dev/null || true)
+            if [ "$CILIUM_CONF_PATH" != "/var/run/multus/cni/net.d" ]; then
+              echo "❌ CiliumConfig cni.confPath should be \`/var/run/multus/cni/net.d\` for OpenShift/Multus, got \`${CILIUM_CONF_PATH:-empty}\`" >> $GITHUB_STEP_SUMMARY
+              VALIDATION_FAILED=1
+            else
+              echo "✅ CiliumConfig cni.confPath is OpenShift/Multus-compatible" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+        fi
+
+        # Check for tenant VLAN leakage in agent-config (Day-1 must be management-only)
+        AGENT_CONFIG="$DATA_DIR/agent-config.yaml"
+        AGENT_API_VERSION=$(yq -r '.apiVersion' "$AGENT_CONFIG")
+        if [ "$AGENT_API_VERSION" != "v1beta1" ]; then
+          echo "❌ AgentConfig apiVersion must be \`v1beta1\`, got: \`$AGENT_API_VERSION\`" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        else
+          echo "✅ AgentConfig apiVersion is v1beta1" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        META_NODE_COUNT=$(yq -r '.nodes | length' "$METADATA")
+        AGENT_HOST_COUNT=$(yq -r '.hosts | length' "$AGENT_CONFIG")
+        if [ "$META_NODE_COUNT" != "$AGENT_HOST_COUNT" ]; then
+          echo "❌ Node/host count mismatch: metadata=\`$META_NODE_COUNT\` agent-config=\`$AGENT_HOST_COUNT\`" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        else
+          echo "✅ AgentConfig host count matches metadata: \`$AGENT_HOST_COUNT\`" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        NTP_COUNT=$(yq -r '.additionalNTPSources // [] | length' "$AGENT_CONFIG")
+        if [ "$NTP_COUNT" -lt 1 ]; then
+          echo "❌ AgentConfig additionalNTPSources is required for live ISO time sync" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        else
+          echo "✅ AgentConfig has \`$NTP_COUNT\` additionalNTPSources entr$( [ "$NTP_COUNT" = "1" ] && echo y || echo ies )" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        if grep -q 'MAC_PLACEHOLDER\|BOOT_DISK_MODEL_PLACEHOLDER' "$AGENT_CONFIG" 2>/dev/null; then
+          echo "ℹ️ AgentConfig contains hardware placeholders; validation will resolve them from live UCS/Intersight data before deploy." >> $GITHUB_STEP_SUMMARY
+          echo '```text' >> $GITHUB_STEP_SUMMARY
+          grep -n 'PLACEHOLDER' "$AGENT_CONFIG" >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        else
+          echo "✅ No hardware placeholders in committed AgentConfig" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        if grep -qE 'vlan:\s*(711|712|713|714)' "$AGENT_CONFIG" 2>/dev/null; then
+          echo "❌ Tenant VLAN (711-714) found in agent-config — Day-1 must be management-only" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        else
+          echo "✅ No tenant VLAN leakage in agent-config" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        if grep -qE 'bond1|eth2|eth3' "$AGENT_CONFIG" 2>/dev/null; then
+          echo "❌ Tenant interface (bond1/eth2/eth3) found in agent-config — Day-1 must be management-only" >> $GITHUB_STEP_SUMMARY
+          VALIDATION_FAILED=1
+        else
+          echo "✅ No tenant interface leakage in agent-config" >> $GITHUB_STEP_SUMMARY
+        fi
+
+        if [ $VALIDATION_FAILED -eq 1 ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**❌ Artifact validation FAILED**" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**✅ All generated artifacts valid**" >> $GITHUB_STEP_SUMMARY
+
+    - name: Resolve and Validate Live UCS Hardware
+      env:
+        INTERSIGHT_API_KEY_ID: ${{ secrets.INTERSIGHT_API_KEY_ID }}
+        INTERSIGHT_SECRET_KEY: ${{ secrets.INTERSIGHT_SECRET_KEY }}
+      run: |
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## Live UCS Hardware Resolution" >> $GITHUB_STEP_SUMMARY
+        CLUSTER="${{ inputs.cluster_name }}"
+        DATA_DIR="data/openshift/${CLUSTER}"
+        AGENT_CONFIG="$DATA_DIR/agent-config.yaml"
+
+        python3 scripts/resolve-agent-hardware.py --cluster "$CLUSTER" --write | tee /tmp/hardware-resolution.log
+        echo '```text' >> $GITHUB_STEP_SUMMARY
+        sed 's/^/  /' /tmp/hardware-resolution.log >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+        if grep -q 'MAC_PLACEHOLDER\|BOOT_DISK_MODEL_PLACEHOLDER' "$AGENT_CONFIG" 2>/dev/null; then
+          echo "❌ Hardware placeholders remain after live UCS resolution." >> $GITHUB_STEP_SUMMARY
+          echo '```text' >> $GITHUB_STEP_SUMMARY
+          grep -n 'PLACEHOLDER' "$AGENT_CONFIG" >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+        MISSING_HINTS=$(yq -r '[.hosts[] | select((.rootDeviceHints // {}) == {})] | length' "$AGENT_CONFIG")
+        if [ "$MISSING_HINTS" != "0" ]; then
+          echo "❌ One or more hosts have no rootDeviceHints after hardware resolution" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+        MISSING_MACS=$(yq -r '[.hosts[].interfaces[] | select((.macAddress // "") == "")] | length' "$AGENT_CONFIG")
+        if [ "$MISSING_MACS" != "0" ]; then
+          echo "❌ One or more interfaces have no MAC after hardware resolution" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+        echo "✅ Live UCS hardware facts resolved into \`$AGENT_CONFIG\`" >> $GITHUB_STEP_SUMMARY
+
+    - name: Commit Resolved Hardware Config
+      run: |
+        CLUSTER="${{ inputs.cluster_name }}"
+        AGENT_CONFIG="data/openshift/${CLUSTER}/agent-config.yaml"
+
+        if git diff --quiet -- "$AGENT_CONFIG"; then
+          echo "✅ Resolved AgentConfig already matches repository." >> $GITHUB_STEP_SUMMARY
+          exit 0
+        fi
+
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add "$AGENT_CONFIG"
+        git commit -m "Update resolved hardware config for ${CLUSTER}"
+        git pull --rebase origin "${GITHUB_REF_NAME}"
+        git push origin HEAD:"${GITHUB_REF_NAME}"
+        echo "✅ Committed resolved AgentConfig for \`${CLUSTER}\`." >> $GITHUB_STEP_SUMMARY
 
     - name: Validate GitHub Secrets
       run: |
@@ -150,7 +330,6 @@ jobs:
           echo "❌ REDHAT_PULL_SECRET not set" >> $GITHUB_STEP_SUMMARY
           VALIDATION_FAILED=1
         else
-          # Validate it's JSON with auths key
           if echo '${{ secrets.REDHAT_PULL_SECRET }}' | jq -e '.auths' > /dev/null 2>&1; then
             AUTH_COUNT=$(echo '${{ secrets.REDHAT_PULL_SECRET }}' | jq '.auths | keys | length')
             echo "✅ REDHAT_PULL_SECRET exists (valid JSON, ${AUTH_COUNT} registries)" >> $GITHUB_STEP_SUMMARY
@@ -163,7 +342,6 @@ jobs:
           echo "❌ SSH_PUBLIC_KEY not set" >> $GITHUB_STEP_SUMMARY
           VALIDATION_FAILED=1
         else
-          # Validate it's an SSH public key
           if echo "${{ secrets.SSH_PUBLIC_KEY }}" | grep -qE "^ssh-(rsa|ed25519|ecdsa)"; then
             KEY_TYPE=$(echo "${{ secrets.SSH_PUBLIC_KEY }}" | awk '{print $1}')
             echo "✅ SSH_PUBLIC_KEY exists (${KEY_TYPE})" >> $GITHUB_STEP_SUMMARY
@@ -176,7 +354,6 @@ jobs:
           echo "❌ REGISTRY_CA_CERT not set (required for registry TLS)" >> $GITHUB_STEP_SUMMARY
           VALIDATION_FAILED=1
         else
-          # Validate it's a PEM certificate
           if echo "${{ secrets.REGISTRY_CA_CERT }}" | grep -q "BEGIN CERTIFICATE"; then
             CERT_CHARS=$(echo "${{ secrets.REGISTRY_CA_CERT }}" | wc -c)
             echo "✅ REGISTRY_CA_CERT exists (valid PEM, ${CERT_CHARS} chars)" >> $GITHUB_STEP_SUMMARY
@@ -189,41 +366,62 @@ jobs:
           exit 1
         fi
 
+    - name: Validate Toolchain Provenance
+      env:
+        RUNNER_CONTAINER_IMAGE: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+      run: |
+        scripts/validate-toolchain-provenance.sh "${{ inputs.cluster_name }}" x86_64
+
     - name: Validate Infrastructure
       run: |
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "## Pre-checks: Infrastructure" >> $GITHUB_STEP_SUMMARY
         VALIDATION_FAILED=0
         CLUSTER="${{ inputs.cluster_name }}"
+        INSTALL_CONFIG="data/openshift/${CLUSTER}/install-config.yaml"
 
-        # Load config
-        BASE_DOMAIN=$(yq -r ".infrastructure.base_domain" openshift/cluster-mappings.yaml)
-        REGISTRY_HOST=$(yq -r ".infrastructure.registry.hostname" openshift/cluster-mappings.yaml)
-        REGISTRY_PORT=$(yq -r ".infrastructure.registry.port" openshift/cluster-mappings.yaml)
+        # Read infra values from generated install-config
+        BASE_DOMAIN=$(yq -r '.baseDomain' "$INSTALL_CONFIG")
+
+        # Registry info from imageDigestSources mirrors
+        REGISTRY_MIRROR=$(yq -r '.imageDigestSources[0].mirrors[0]' "$INSTALL_CONFIG")
+        REGISTRY_HOST=$(echo "$REGISTRY_MIRROR" | cut -d: -f1)
+        REGISTRY_PORT=$(echo "$REGISTRY_MIRROR" | cut -d: -f2 | cut -d/ -f1)
 
         # Check DNS resolution
         if getent hosts api.$CLUSTER.$BASE_DOMAIN > /dev/null 2>&1; then
           RESOLVED_IP=$(getent hosts api.$CLUSTER.$BASE_DOMAIN | awk '{print $1}')
-          echo "✅ DNS: api.$CLUSTER.$BASE_DOMAIN → $RESOLVED_IP" >> $GITHUB_STEP_SUMMARY
+          echo "✅ DNS: \`api.$CLUSTER.$BASE_DOMAIN\` → \`$RESOLVED_IP\`" >> $GITHUB_STEP_SUMMARY
         else
-          echo "❌ DNS: api.$CLUSTER.$BASE_DOMAIN does NOT resolve" >> $GITHUB_STEP_SUMMARY
+          echo "❌ DNS: \`api.$CLUSTER.$BASE_DOMAIN\` does NOT resolve" >> $GITHUB_STEP_SUMMARY
           VALIDATION_FAILED=1
         fi
 
-        # Check registry accessible (uses HTTPS with self-signed cert)
+        OCP_VERSION=$(yq -r '.ocpVersion' "data/openshift/${CLUSTER}/metadata.yaml")
+
+        # Check registry accessible and exact payload exists.
         REGISTRY_URL="https://$REGISTRY_HOST:$REGISTRY_PORT"
         if curl -skf "$REGISTRY_URL/v2/" > /dev/null 2>&1; then
-          echo "✅ Registry accessible at $REGISTRY_URL" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Registry accessible at \`$REGISTRY_URL\`" >> $GITHUB_STEP_SUMMARY
 
-          # Check for required images (warning only - Phase 4 handles mirroring)
-          if curl -skf "$REGISTRY_URL/v2/openshift/release-images/tags/list" > /dev/null 2>&1; then
-            echo "✅ Required images exist (openshift/release-images)" >> $GITHUB_STEP_SUMMARY
+          TAGS_RESPONSE=$(curl -skf "$REGISTRY_URL/v2/openshift/release-images/tags/list" 2>/dev/null || true)
+          if [ -n "$TAGS_RESPONSE" ]; then
+            echo "✅ Required image repo exists (openshift/release-images)" >> $GITHUB_STEP_SUMMARY
+            RELEASE_TAG=$(echo "$TAGS_RESPONSE" | jq -r ".tags[] | select(. == \"${OCP_VERSION}-x86_64\")" | sort -V | tail -1)
+            if [ -z "$RELEASE_TAG" ]; then
+              echo "❌ Exact release tag not found: \`${OCP_VERSION}-x86_64\`" >> $GITHUB_STEP_SUMMARY
+              echo "- Run sync-images for the exact \`metadata.ocpVersion\` before deployment." >> $GITHUB_STEP_SUMMARY
+              VALIDATION_FAILED=1
+            else
+              echo "✅ Exact release tag exists: \`$RELEASE_TAG\`" >> $GITHUB_STEP_SUMMARY
+            fi
           else
-            echo "⚠️  Required images NOT found (openshift/release-images)" >> $GITHUB_STEP_SUMMARY
-            echo "   Run: gh workflow run sync-images.yaml -f dry_run=false" >> $GITHUB_STEP_SUMMARY
+            echo "❌ Required images NOT found (openshift/release-images)" >> $GITHUB_STEP_SUMMARY
+            echo "- Run: \`gh workflow run sync-images.yaml -f dry_run=false\`" >> $GITHUB_STEP_SUMMARY
+            VALIDATION_FAILED=1
           fi
         else
-          echo "❌ Registry NOT accessible at $REGISTRY_URL" >> $GITHUB_STEP_SUMMARY
+          echo "❌ Registry NOT accessible at \`$REGISTRY_URL\`" >> $GITHUB_STEP_SUMMARY
           VALIDATION_FAILED=1
         fi
 
@@ -231,11 +429,11 @@ jobs:
         WEB_URL="${{ vars.OCP_ISO_SERVER_URL }}"
         HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$WEB_URL/" 2>/dev/null || echo "000")
         if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "403" ]; then
-          echo "✅ Web server accessible at $WEB_URL (HTTP $HTTP_CODE)" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Web server accessible at \`$WEB_URL\` (HTTP \`$HTTP_CODE\`)" >> $GITHUB_STEP_SUMMARY
         elif [ "$HTTP_CODE" = "401" ]; then
-          echo "✅ Web server accessible at $WEB_URL (requires auth)" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Web server accessible at \`$WEB_URL\` (requires auth)" >> $GITHUB_STEP_SUMMARY
         else
-          echo "❌ Web server NOT accessible at $WEB_URL (HTTP $HTTP_CODE)" >> $GITHUB_STEP_SUMMARY
+          echo "❌ Web server NOT accessible at \`$WEB_URL\` (HTTP \`$HTTP_CODE\`)" >> $GITHUB_STEP_SUMMARY
           VALIDATION_FAILED=1
         fi
 
@@ -253,21 +451,19 @@ jobs:
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "## Pre-checks: HTTP Authentication" >> $GITHUB_STEP_SUMMARY
 
-        # Check secrets exist
         if [ -z "$HTTP_USER" ] || [ -z "$HTTP_PASS" ]; then
           echo "❌ HTTP_SERVER_USER or HTTP_SERVER_PASSWORD not set" >> $GITHUB_STEP_SUMMARY
           exit 1
         fi
 
-        # Test authentication actually works
         WEB_URL="${{ vars.OCP_ISO_SERVER_URL }}"
         HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -u "${HTTP_USER}:${HTTP_PASS}" "$WEB_URL/" 2>/dev/null || echo "000")
 
         if [ "$HTTP_CODE" = "200" ]; then
           echo "✅ HTTP authentication successful" >> $GITHUB_STEP_SUMMARY
         else
-          echo "❌ HTTP authentication FAILED (HTTP $HTTP_CODE)" >> $GITHUB_STEP_SUMMARY
-          echo "   Check HTTP_SERVER_PASSWORD matches htpasswd on runner VM" >> $GITHUB_STEP_SUMMARY
+          echo "❌ HTTP authentication FAILED (HTTP \`$HTTP_CODE\`)." >> $GITHUB_STEP_SUMMARY
+          echo "- Check \`HTTP_SERVER_PASSWORD\` matches htpasswd on runner VM." >> $GITHUB_STEP_SUMMARY
           exit 1
         fi
 
@@ -276,4 +472,4 @@ jobs:
       run: |
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "---" >> $GITHUB_STEP_SUMMARY
-        echo "**✅ OpenShift validation passed for cluster: ${{ inputs.cluster_name }}**" >> $GITHUB_STEP_SUMMARY
+        echo "**✅ OpenShift validation passed for cluster: \`${{ inputs.cluster_name }}\`**" >> $GITHUB_STEP_SUMMARY

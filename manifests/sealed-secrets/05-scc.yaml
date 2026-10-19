@@ -1,7 +1,3 @@
-# Copyright (c) 2026 Cisco and/or its affiliates.
-# Licensed under the Cisco Sample Code License, Version 1.1
-# See LICENSE in the project root.
-
 # Sealed Secrets SCC - allows running with fsGroup 65534 and seccomp profile
 # Required for OpenShift: restricted-v2 SCC rejects fsGroup 65534
 apiVersion: security.openshift.io/v1

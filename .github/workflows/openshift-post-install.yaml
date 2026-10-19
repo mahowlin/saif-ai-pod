@@ -35,14 +35,25 @@ on:
   workflow_dispatch:
     inputs:
       cluster_name:
-        description: 'Target cluster'
+        description: 'Target cluster (e.g. example-node-1, example-management)'
         required: true
-        type: choice
-        options:
-          - ai-pod-1
-          - ai-pod-2
-          - ai-pod-3
-          - ai-pod-4
+        type: string
+      cluster_dir:
+        description: 'Absolute private prepared/enriched cluster directory (separate from raw target)'
+        type: string
+        required: true
+      artifact_manifest:
+        description: 'Absolute pristine GeneratedArtifactManifest path (required for connected mode)'
+        type: string
+        required: false
+      raw_target_root:
+        description: 'Absolute pristine generated compute root containing data/ (connected mode)'
+        type: string
+        required: false
+      gitops_target_root:
+        description: 'Absolute clean customer GitOps checkout at declared origin/revision'
+        type: string
+        required: true
       apply_idms:
         description: 'Download and apply latest IDMS from sync-images'
         required: false
@@ -58,6 +69,22 @@ on:
       cluster_name:
         type: string
         required: true
+      cluster_dir:
+        description: 'Absolute private prepared/enriched cluster directory (separate from raw target)'
+        type: string
+        required: true
+      artifact_manifest:
+        description: 'Absolute pristine GeneratedArtifactManifest path (required for connected mode)'
+        type: string
+        required: false
+      raw_target_root:
+        description: 'Absolute pristine generated compute root containing data/ (connected mode)'
+        type: string
+        required: false
+      gitops_target_root:
+        description: 'Absolute clean customer GitOps checkout at declared origin/revision'
+        type: string
+        required: true
       apply_idms:
         type: boolean
         required: false
@@ -70,19 +97,46 @@ on:
 permissions:
   contents: write
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   configure:
     name: 'Apply Post-Install Configuration'
-    runs-on: [self-hosted, linux, saif-github-runner]
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     container:
-      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
 
     env:
       CLUSTER: ${{ inputs.cluster_name }}
+      CLUSTER_DIR: ${{ inputs.cluster_dir }}
+      ARTIFACT_MANIFEST: ${{ inputs.artifact_manifest }}
+      RAW_TARGET_ROOT: ${{ inputs.raw_target_root }}
+      GITOPS_TARGET_ROOT: ${{ inputs.gitops_target_root }}
 
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+
+    # Consume the previously prepared private tree; never re-enrich pristine inputs here.
+    - name: Validate Selected Cluster Contract
+      env:
+        GITOPS_BOOTSTRAP_DIR: ${{ runner.temp }}/gitops-bootstrap-${{ github.run_id }}-${{ github.run_attempt }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        [[ "$CLUSTER_DIR" = /* && "$GITOPS_TARGET_ROOT" = /* ]] || { echo "::error::cluster_dir and gitops_target_root must be absolute prepared runner paths"; exit 1; }
+        [[ "${CLUSTER_DIR##*/}" = "$CLUSTER" ]] || { echo "::error::cluster_dir basename must match cluster_name"; exit 1; }
+        args=(--cluster-dir "$CLUSTER_DIR" --action post-install --gitops-target-root "$GITOPS_TARGET_ROOT")
+        if [[ -n "$ARTIFACT_MANIFEST" || -n "$RAW_TARGET_ROOT" ]]; then
+          [[ "$ARTIFACT_MANIFEST" = /* && "$RAW_TARGET_ROOT" = /* ]] || { echo "::error::artifact_manifest and raw_target_root must both be absolute paths"; exit 1; }
+          args+=(--artifact-manifest "$ARTIFACT_MANIFEST" --raw-target-root "$RAW_TARGET_ROOT")
+        fi
+        python3 scripts/validate-selected-cluster-contract.py "${args[@]}" --gitops-output-dir "$GITOPS_BOOTSTRAP_DIR"
+        cat "$GITOPS_BOOTSTRAP_DIR/selection.env" >> "$GITHUB_ENV"
+        printf 'GITOPS_BOOTSTRAP_DIR=%s\n' "$GITOPS_BOOTSTRAP_DIR" >> "$GITHUB_ENV"
+        echo "Selected cluster and customer GitOps root validated" >> "$GITHUB_STEP_SUMMARY"
 
     - name: Retrieve Kubeconfig
       env:
@@ -100,46 +154,64 @@ jobs:
           exit 1
         fi
 
-        # Get cluster IP and base domain
-        CLUSTER_IP=$(yq -r ".clusters[] | select(.name == \"$CLUSTER\") | .ip" openshift/cluster-mappings.yaml)
-        BASE_DOMAIN=$(yq -r ".infrastructure.base_domain" openshift/cluster-mappings.yaml)
+        # Get cluster IP and base domain from SAIF-generated artifacts
+        CLUSTER_IP=$(yq -r '.rendezvousIP' "$CLUSTER_DIR/agent-config.yaml")
+        BASE_DOMAIN=$(yq -r '.baseDomain' "$CLUSTER_DIR/install-config.yaml")
 
         if [ -z "$CLUSTER_IP" ] || [ "$CLUSTER_IP" = "null" ]; then
           echo "::error::Cannot find IP for cluster $CLUSTER"
           exit 1
         fi
 
-        # SSH to cluster and retrieve recovery kubeconfig
-        echo "$SSH_PRIVATE_KEY" > /tmp/ssh_key
-        chmod 600 /tmp/ssh_key
+        # SSH to cluster and retrieve the first usable ABI kubeconfig.
+        # Compact bootstrap exposes /opt/openshift/auth/kubeconfig early; SNO may only
+        # have localhost-recovery.kubeconfig once fully installed.
+        umask 077
+        POST_PRIVATE_DIR=$(mktemp -d "$RUNNER_TEMP/post-install.XXXXXX")
+        echo "POST_PRIVATE_DIR=$POST_PRIVATE_DIR" >> "$GITHUB_ENV"
+        SSH_KEY_FILE="$POST_PRIVATE_DIR/ssh-key"
+        trap 'rm -f -- "$SSH_KEY_FILE"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        printf '%s\n' "$SSH_PRIVATE_KEY" > "$SSH_KEY_FILE"
 
-        RECOVERY_KUBECONFIG="/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/localhost-recovery.kubeconfig"
-        KUBECONFIG_FILE="/tmp/kubeconfig-${CLUSTER}"
+        KUBECONFIG_CANDIDATES="/opt/openshift/auth/kubeconfig /var/opt/openshift/auth/kubeconfig /etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/localhost-recovery.kubeconfig /etc/kubernetes/kubeconfig"
+        KUBECONFIG_FILE="$POST_PRIVATE_DIR/kubeconfig"
 
         echo "Retrieving kubeconfig via SSH to core@$CLUSTER_IP..."
-        if ssh -i /tmp/ssh_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 \
-          core@$CLUSTER_IP "sudo cat $RECOVERY_KUBECONFIG" > "$KUBECONFIG_FILE" 2>/dev/null; then
+        SELECTED_KUBECONFIG=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 \
+          core@$CLUSTER_IP "for p in $KUBECONFIG_CANDIDATES; do if sudo test -s \"\$p\" && sudo KUBECONFIG=\"\$p\" oc get --raw=/version >/dev/null 2>&1; then echo \"\$p\"; exit 0; fi; done" 2>/dev/null || true)
+
+        if [ -z "$SELECTED_KUBECONFIG" ]; then
+          echo "::error::Failed to find a usable kubeconfig on cluster via SSH"
+          echo "❌ No usable kubeconfig found on core@$CLUSTER_IP" >> $GITHUB_STEP_SUMMARY
+          rm -f "$SSH_KEY_FILE"
+          exit 1
+        fi
+
+        if ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 \
+          core@$CLUSTER_IP "sudo cat $SELECTED_KUBECONFIG" > "$KUBECONFIG_FILE" 2>/dev/null; then
 
           if [ -s "$KUBECONFIG_FILE" ]; then
             # Update server URL to use cluster API endpoint (not localhost)
             sed -i "s|server: https://localhost:6443|server: https://api.$CLUSTER.$BASE_DOMAIN:6443|g" "$KUBECONFIG_FILE"
             sed -i "s|server: https://127.0.0.1:6443|server: https://api.$CLUSTER.$BASE_DOMAIN:6443|g" "$KUBECONFIG_FILE"
 
-            echo "✅ Kubeconfig retrieved via SSH" >> $GITHUB_STEP_SUMMARY
+            echo "✅ Kubeconfig retrieved via SSH from $SELECTED_KUBECONFIG" >> $GITHUB_STEP_SUMMARY
             echo "KUBECONFIG=$KUBECONFIG_FILE" >> $GITHUB_ENV
           else
-            rm -f /tmp/ssh_key
+            rm -f "$SSH_KEY_FILE"
             echo "::error::Retrieved kubeconfig is empty"
             exit 1
           fi
         else
           echo "::error::Failed to retrieve kubeconfig from cluster via SSH"
           echo "❌ SSH to cluster failed - is the cluster operational?" >> $GITHUB_STEP_SUMMARY
-          rm -f /tmp/ssh_key
+          rm -f "$SSH_KEY_FILE"
           exit 1
         fi
 
-        rm -f /tmp/ssh_key
+        rm -f "$SSH_KEY_FILE"
 
     - name: Verify Cluster Access
       shell: bash
@@ -168,6 +240,7 @@ jobs:
       env:
         KUBECONFIG_REPO_TOKEN: ${{ secrets.KUBECONFIG_REPO_TOKEN }}
       run: |
+        set -euo pipefail
         echo "### Kubeconfig Commit" >> $GITHUB_STEP_SUMMARY
 
         if [ -z "$KUBECONFIG_REPO_TOKEN" ]; then
@@ -175,17 +248,27 @@ jobs:
           exit 0
         fi
 
-        # Clone kubeconfigs repo
-        git clone --depth 1 \
-          # Configure this URL for your kubeconfig storage repository
-          "https://x-access-token:${KUBECONFIG_REPO_TOKEN}@github.com/mahowlin/saif-kubeconfigs.git" \
-          /tmp/kubeconfigs
+        [[ "$CLUSTER" =~ ^[a-z0-9][a-z0-9-]*$ ]] || exit 1
+        # Optional private destination is explicit execution input.
+        KUBECONFIG_REPOSITORY="${{ vars.KUBECONFIG_REPOSITORY }}"
+        KUBECONFIG_REF="${{ vars.KUBECONFIG_REF }}"
+        [[ "$KUBECONFIG_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && test -n "$KUBECONFIG_REF" || exit 1
+        umask 077
+        KUBECONFIG_WRITE_DIR=$(mktemp -d "$RUNNER_TEMP/kubeconfig-write.XXXXXX")
+        trap 'rm -rf -- "$KUBECONFIG_WRITE_DIR"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        export GIT_CONFIG_COUNT=1
+        export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+        export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$KUBECONFIG_REPO_TOKEN" | base64 | tr -d '\n')"
+        git clone --depth 1 --branch "$KUBECONFIG_REF" \
+          "https://github.com/$KUBECONFIG_REPOSITORY.git" "$KUBECONFIG_WRITE_DIR/repository"
 
         # Copy fresh kubeconfig to repo
-        mkdir -p "/tmp/kubeconfigs/clusters/${CLUSTER}"
-        cp "$KUBECONFIG" "/tmp/kubeconfigs/clusters/${CLUSTER}/kubeconfig"
+        mkdir -p "$KUBECONFIG_WRITE_DIR/repository/clusters/${CLUSTER}"
+        cp "$KUBECONFIG" "$KUBECONFIG_WRITE_DIR/repository/clusters/${CLUSTER}/kubeconfig"
 
-        cd /tmp/kubeconfigs
+        cd "$KUBECONFIG_WRITE_DIR/repository"
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
         git add "clusters/${CLUSTER}/kubeconfig"
@@ -250,12 +333,30 @@ jobs:
       run: |
         echo "### IDMS Application (Day 1 Bootstrap)" >> $GITHUB_STEP_SUMMARY
 
-        # Apply minimal bootstrap IDMS from local manifests
-        # Full IDMS is managed via Day 2 GitOps (platform-idms ArgoCD Application)
-        echo "Applying bootstrap IDMS..."
-        oc apply -f manifests/idms/bootstrap-idms.yaml
+        # Apply selected GitOps bootstrap image-policy bundle from the rendered cluster folder.
+        # Full Day 2 IDMS is managed via GitOps (platform-idms ArgoCD Application).
+        DATA_DIR="$CLUSTER_DIR"
+        BUNDLE_REF=$(yq -r '.imagePolicyBundles.gitopsBootstrap // ""' "$DATA_DIR/metadata.yaml")
+        DELIVERY_MODE=$(yq -r '.imageDelivery.mode' "$DATA_DIR/metadata.yaml")
+        if [ "$DELIVERY_MODE" = "connected" ]; then
+          echo "Connected delivery: no bootstrap mirror policy selected" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+        if [ -z "$BUNDLE_REF" ] || [ "$BUNDLE_REF" = "null" ]; then
+          echo "❌ Missing metadata imagePolicyBundles.gitopsBootstrap" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+        if [ "$BUNDLE_REF" = "gitops-bootstrap" ]; then
+          BUNDLE_DIR="$DATA_DIR/image-policy-bundles/gitops-bootstrap"
+        elif [[ "$BUNDLE_REF" = /* ]]; then
+          BUNDLE_DIR="$BUNDLE_REF"
+        else
+          BUNDLE_DIR="$DATA_DIR/$BUNDLE_REF"
+        fi
+        echo "Applying selected gitops-bootstrap image-policy bundle from $BUNDLE_DIR..."
+        oc apply -f "$BUNDLE_DIR/manifests/"
 
-        echo "✅ Applied bootstrap IDMS (openshift4, openshift-gitops-1, redhat)" >> $GITHUB_STEP_SUMMARY
+        echo "✅ Applied selected gitops-bootstrap image-policy bundle" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "**Note:** Full IDMS is managed via GitOps (platform-idms Application)." >> $GITHUB_STEP_SUMMARY
         echo "ArgoCD will sync complete IDMS after bootstrap." >> $GITHUB_STEP_SUMMARY
@@ -292,7 +393,10 @@ jobs:
       env:
         ARGO_GIT_TOKEN: ${{ secrets.ARGO_GIT_TOKEN }}
       run: |
+        set -euo pipefail
         echo "### ArgoCD Bootstrap" >> $GITHUB_STEP_SUMMARY
+        # All selection variables and subscription.yaml were validated before credentials/API.
+        export GITOPS_REPO_URL GITOPS_TARGET_REVISION GITOPS_ROOT
 
         # Check if ArgoCD is already installed
         if oc get argocd openshift-gitops -n openshift-gitops &>/dev/null; then
@@ -300,9 +404,11 @@ jobs:
 
           # Check if saif-apps exists and points to correct path
           CURRENT_PATH=$(oc get application saif-apps -n openshift-gitops -o jsonpath='{.spec.source.path}' 2>/dev/null || echo "")
-          EXPECTED_PATH="clusters/${CLUSTER}"
+          EXPECTED_PATH="$GITOPS_ROOT"
 
-          if [ "$CURRENT_PATH" = "$EXPECTED_PATH" ]; then
+          CURRENT_REPO=$(oc get application saif-apps -n openshift-gitops -o jsonpath='{.spec.source.repoURL}' 2>/dev/null || true)
+          CURRENT_REVISION=$(oc get application saif-apps -n openshift-gitops -o jsonpath='{.spec.source.targetRevision}' 2>/dev/null || true)
+          if [ "$CURRENT_PATH" = "$EXPECTED_PATH" ] && [ "$CURRENT_REPO" = "$GITOPS_REPO_URL" ] && [ "$CURRENT_REVISION" = "$GITOPS_TARGET_REVISION" ]; then
             echo "✅ ArgoCD configured correctly for ${CLUSTER}" >> $GITHUB_STEP_SUMMARY
 
             # Update credentials in case they changed
@@ -311,10 +417,10 @@ jobs:
             echo "✅ GitHub credentials updated" >> $GITHUB_STEP_SUMMARY
 
             # Ensure TLS trust is configured (idempotent)
-            if oc get cm user-ca-bundle -n openshift-config &>/dev/null; then
-              oc get cm user-ca-bundle -n openshift-config -o jsonpath='{.data.ca-bundle\.crt}' > /tmp/registry-ca.crt
+            if [ "$GITOPS_REGISTRY_TRUST_POLICY" = "additional-ca" ]; then
+              oc get cm user-ca-bundle -n openshift-config -o jsonpath='{.data.ca-bundle\.crt}' > "$GITOPS_BOOTSTRAP_DIR/registry-ca.crt"
               oc create configmap argocd-tls-certs-cm -n openshift-gitops \
-                --from-file="registry.example.com=/tmp/registry-ca.crt" \
+                --from-file="$GITOPS_REGISTRY_HOST=$GITOPS_BOOTSTRAP_DIR/registry-ca.crt" \
                 --dry-run=client -o yaml | oc apply -f -
               echo "✅ ArgoCD TLS trust ensured" >> $GITHUB_STEP_SUMMARY
             fi
@@ -325,25 +431,30 @@ jobs:
         fi
 
         # Step 1: Install OpenShift GitOps Operator (if not present)
-        if ! oc get csv -n openshift-operators 2>/dev/null | grep -q "openshift-gitops-operator.*Succeeded"; then
+        if ! oc get csv -n "$GITOPS_OPERATOR_NAMESPACE" 2>/dev/null | grep -q "${GITOPS_OPERATOR_NAME}.*Succeeded"; then
           # Check if subscription exists in failed state - clean up first for idempotency
-          SUB_STATUS=$(oc get subscription openshift-gitops-operator -n openshift-operators -o jsonpath='{.status.conditions[?(@.type=="BundleUnpackFailed")].status}' 2>/dev/null || echo "")
+          SUB_STATUS=$(oc get subscription "$GITOPS_OPERATOR_NAME" -n "$GITOPS_OPERATOR_NAMESPACE" -o jsonpath='{.status.conditions[?(@.type=="BundleUnpackFailed")].status}' 2>/dev/null || echo "")
           if [ "$SUB_STATUS" = "True" ]; then
             echo "Found failed subscription, cleaning up for retry..."
-            oc delete subscription openshift-gitops-operator -n openshift-operators 2>/dev/null || true
+            oc delete subscription "$GITOPS_OPERATOR_NAME" -n "$GITOPS_OPERATOR_NAMESPACE" 2>/dev/null || true
             # Refresh catalog pod to pick up IDMS changes
-            oc delete pod -n openshift-marketplace -l olm.catalogSource=redhat-operators-local 2>/dev/null || true
+            oc delete pod -n "$GITOPS_OPERATOR_SOURCE_NAMESPACE" -l "olm.catalogSource=$GITOPS_OPERATOR_SOURCE" 2>/dev/null || true
             echo "Waiting for catalog pod to restart..."
             sleep 30
           fi
 
-          echo "Installing OpenShift GitOps operator..."
-          oc apply -f manifests/argocd/01-subscription.yaml
+          oc get catalogsource "$GITOPS_OPERATOR_SOURCE" -n "$GITOPS_OPERATOR_SOURCE_NAMESPACE" >/dev/null
+          echo "Installing OpenShift GitOps operator from selected catalog..."
+          oc apply -f "$GITOPS_BOOTSTRAP_DIR/subscription.yaml"
+          if [ "$GITOPS_OPERATOR_APPROVAL" = "Manual" ]; then
+            echo "Selected Manual InstallPlan approval: an authorized operator must review/approve it, then rerun post-install." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
 
           # Wait for operator
           echo "Waiting for operator installation..."
           for i in {1..30}; do
-            if oc get csv -n openshift-operators 2>/dev/null | grep -q "openshift-gitops-operator.*Succeeded"; then
+            if oc get csv -n "$GITOPS_OPERATOR_NAMESPACE" 2>/dev/null | grep -q "${GITOPS_OPERATOR_NAME}.*Succeeded"; then
               echo "✅ Operator installed" >> $GITHUB_STEP_SUMMARY
               break
             fi
@@ -387,21 +498,21 @@ jobs:
         # The registry CA is already in user-ca-bundle (from install-config additionalTrustBundle)
         # ArgoCD needs this to pull Helm charts from the OCI registry
         echo "Configuring ArgoCD TLS trust for OCI registry..."
-        if oc get cm user-ca-bundle -n openshift-config &>/dev/null; then
-          oc get cm user-ca-bundle -n openshift-config -o jsonpath='{.data.ca-bundle\.crt}' > /tmp/registry-ca.crt
+        if [ "$GITOPS_REGISTRY_TRUST_POLICY" = "additional-ca" ]; then
+          oc get cm user-ca-bundle -n openshift-config -o jsonpath='{.data.ca-bundle\.crt}' > "$GITOPS_BOOTSTRAP_DIR/registry-ca.crt"
           oc create configmap argocd-tls-certs-cm -n openshift-gitops \
-            --from-file="registry.example.com=/tmp/registry-ca.crt" \
+            --from-file="$GITOPS_REGISTRY_HOST=$GITOPS_BOOTSTRAP_DIR/registry-ca.crt" \
             --dry-run=client -o yaml | oc apply -f -
           echo "✅ ArgoCD TLS trust configured for OCI registry" >> $GITHUB_STEP_SUMMARY
         else
-          echo "⚠️ No user-ca-bundle found, skipping OCI TLS config" >> $GITHUB_STEP_SUMMARY
+          echo "No additional registry CA selected; retaining normal system trust" >> $GITHUB_STEP_SUMMARY
         fi
 
         # Step 6: Apply cluster-specific App-of-Apps
         # CLUSTER env var is set at job level
         echo "Applying App-of-Apps for ${CLUSTER}..."
         envsubst < manifests/argocd/03-app-of-apps.yaml | oc apply -f -
-        echo "✅ App-of-Apps applied (path: clusters/${CLUSTER})" >> $GITHUB_STEP_SUMMARY
+        echo "✅ App-of-Apps applied (path: ${GITOPS_ROOT})" >> $GITHUB_STEP_SUMMARY
 
         # Step 7: Wait for sync
         echo "Waiting for initial sync..."
@@ -415,6 +526,7 @@ jobs:
           fi
           if [ "$i" -eq 20 ]; then
             echo "⚠️ ArgoCD sync pending (status: $SYNC_STATUS, health: $HEALTH_STATUS)" >> $GITHUB_STEP_SUMMARY
+            exit 1
           fi
           echo "Sync status: $SYNC_STATUS, Health: $HEALTH_STATUS ($i/20)"
           sleep 15
@@ -488,4 +600,5 @@ jobs:
     - name: Cleanup
       if: always()
       run: |
-        rm -rf /tmp/kubeconfigs /tmp/kubeconfig-* /tmp/idms-download /tmp/ssh_key
+        if [ -n "${POST_PRIVATE_DIR:-}" ]; then rm -rf -- "$POST_PRIVATE_DIR"; fi
+        rm -rf /tmp/idms-download

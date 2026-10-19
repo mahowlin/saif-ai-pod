@@ -27,10 +27,10 @@ on:
         required: true
         type: choice
         options:
-          - saif-ai-pod-1
-          - saif-ai-pod-2
-          - saif-ai-pod-3
-          - saif-ai-pod-4
+          - saif-example-node-1
+          - saif-example-node-2
+          - saif-example-node-3
+          - saif-example-node-4
   workflow_call:
     inputs:
       server_profile:
@@ -38,29 +38,28 @@ on:
         required: true
 
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   validate:
     name: 'Validate UCS Prerequisites'
-    runs-on: [self-hosted, linux, saif-github-runner]
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     container:
-      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
 
     steps:
     - name: Checkout
       uses: actions/checkout@v4
 
     - name: Validate Server Profile Name
+      env:
+        SERVER_TARGET: ${{ inputs.server_profile }}
+        OPERATION: Plan
+        DOMAIN_STATE: Unchanged
       run: |
-        echo "## UCS Validation" >> $GITHUB_STEP_SUMMARY
-        PROFILE="${{ inputs.server_profile }}"
-
-        # Validate profile name format
-        if echo "$PROFILE" | grep -qE '^saif-ai-pod-[0-9]+$'; then
-          echo "✅ Server profile: $PROFILE" >> $GITHUB_STEP_SUMMARY
-        else
-          echo "❌ Invalid server profile format: $PROFILE" >> $GITHUB_STEP_SUMMARY
-          exit 1
-        fi
+        python3 scripts/select-ucs-profiles.py
 
     - name: Validate Intersight Credentials
       run: |
@@ -91,6 +90,10 @@ jobs:
     - name: Validation Summary
       if: always()
       run: |
+        if [ "${{ job.status }}" != success ]; then
+          echo "Validation failed or was cancelled; inspect prior steps." >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+        fi
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "---" >> $GITHUB_STEP_SUMMARY
         echo "**✅ UCS validation passed for profile: ${{ inputs.server_profile }}**" >> $GITHUB_STEP_SUMMARY

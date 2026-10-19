@@ -14,8 +14,8 @@
 # or implied.
 
 # Cluster-specific App-of-Apps
-# Points to clusters/${CLUSTER}/ in saif-gitops
-# ${CLUSTER} is substituted by envsubst at apply time
+# Points to the validated metadata.gitopsBootstrapPath in the declared GitOps repo
+# ${GITOPS_ROOT} is substituted by envsubst after checkout/root validation
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -26,9 +26,9 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/mahowlin/saif-gitops.git
-    targetRevision: main
-    path: clusters/${CLUSTER}
+    repoURL: ${GITOPS_REPO_URL}
+    targetRevision: ${GITOPS_TARGET_REVISION}
+    path: ${GITOPS_ROOT}
   destination:
     server: https://kubernetes.default.svc
     namespace: openshift-gitops

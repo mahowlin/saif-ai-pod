@@ -13,123 +13,81 @@
 # IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
 # or implied.
 
-name: 'Deploy End-to-End'
+name: 'Compute Deployment'
 
+# Airgap image production and GitOps post-install use their owning pipelines.
+# This wrapper calls only real Compute reusable workflows and declared inputs.
 on:
   workflow_dispatch:
     inputs:
       action:
-        description: 'Action to perform'
-        required: true
+        description: 'Compute operation; DRY-RUN validates files and plans UCS only'
         type: choice
-        options:
-          - DRY-RUN
-          - DEPLOY
-        default: 'DRY-RUN'
+        options: [DRY-RUN, DEPLOY]
+        default: DRY-RUN
       phases:
-        description: 'Phases to run (comma-separated: sync-images,ucs,openshift,argocd)'
-        required: false
-        type: string
-        default: 'ucs'
-      environment:
-        description: 'Target environment'
-        required: false
+        description: 'Selected Compute phases'
         type: choice
-        options:
-          - example
-        default: 'example'
-      skip_validation:
-        description: 'Skip CI validation step'
+        options: [ucs, openshift, 'ucs,openshift']
+        default: ucs
+      server_target:
+        description: 'Declared UCS profile name or ALL'
+        type: string
+        default: ALL
+      cluster_name:
+        description: 'Declared cluster name, required for openshift'
+        type: string
         required: false
-        type: boolean
-        default: false
 
 permissions:
-  contents: read
+  contents: write
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  ci-validation:
-    name: 'CI Validation'
-    if: inputs.skip_validation == false
-    uses: ./.github/workflows/ci-validation.yaml
-
-  sync-images:
-    name: 'Sync Images (Phase 0b)'
-    needs: [ci-validation]
-    if: |
-      always() &&
-      (needs.ci-validation.result == 'success' || needs.ci-validation.result == 'skipped' || inputs.skip_validation == true) &&
-      contains(inputs.phases, 'sync-images')
-    uses: ./.github/workflows/sync-images.yaml
-    with:
-      dry_run: ${{ inputs.action == 'DRY-RUN' }}
-    secrets:
-      REDHAT_PULL_SECRET: ${{ secrets.REDHAT_PULL_SECRET }}
+  preflight:
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    container:
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate selected Compute inputs
+        env:
+          ACTION: ${{ inputs.action }}
+          PHASES: ${{ inputs.phases }}
+          CLUSTER: ${{ inputs.cluster_name }}
+          SERVER_TARGET: ${{ inputs.server_target }}
+          OPERATION: ${{ inputs.action == 'DRY-RUN' && 'Plan' || 'Activate' }}
+          DOMAIN_STATE: Unchanged
+        run: |
+          set -euo pipefail
+          case "$ACTION" in DRY-RUN|DEPLOY) ;; *) exit 1 ;; esac
+          case "$PHASES" in ucs|openshift|ucs,openshift) ;; *) exit 1 ;; esac
+          if [[ ",$PHASES," == *,ucs,* ]]; then
+            python3 scripts/select-ucs-profiles.py
+          fi
+          if [[ ",$PHASES," == *,openshift,* ]]; then
+            [[ "$CLUSTER" =~ ^[A-Za-z0-9_.-]+$ ]]
+            test -f "data/openshift/$CLUSTER/metadata.yaml"
+          fi
 
   deploy-ucs:
-    name: 'Deploy UCS (Phase 1)'
-    needs: [ci-validation, sync-images]
-    if: |
-      always() &&
-      (needs.ci-validation.result == 'success' || needs.ci-validation.result == 'skipped' || inputs.skip_validation == true) &&
-      (needs.sync-images.result == 'success' || needs.sync-images.result == 'skipped') &&
-      contains(inputs.phases, 'ucs')
+    needs: preflight
+    if: contains(inputs.phases, 'ucs')
     uses: ./.github/workflows/ucs-deploy.yaml
     with:
-      action: ${{ inputs.action }}
-    secrets:
-      INTERSIGHT_API_KEY_ID: ${{ secrets.INTERSIGHT_API_KEY_ID }}
-      INTERSIGHT_SECRET_KEY: ${{ secrets.INTERSIGHT_SECRET_KEY }}
+      operation: ${{ inputs.action == 'DRY-RUN' && 'Plan' || 'Activate' }}
+      server_target: ${{ inputs.server_target }}
+      domain_state: Unchanged
+    secrets: inherit
 
   deploy-openshift:
-    name: 'Deploy OpenShift (Phase 2)'
-    needs: [ci-validation, deploy-ucs]
-    if: |
-      always() &&
-      (needs.ci-validation.result == 'success' || needs.ci-validation.result == 'skipped' || inputs.skip_validation == true) &&
-      (needs.deploy-ucs.result == 'success' || needs.deploy-ucs.result == 'skipped') &&
-      contains(inputs.phases, 'openshift')
+    needs: [preflight, deploy-ucs]
+    if: always() && needs.preflight.result == 'success' && (needs.deploy-ucs.result == 'success' || needs.deploy-ucs.result == 'skipped') && contains(inputs.phases, 'openshift')
     uses: ./.github/workflows/openshift-deploy.yaml
     with:
-      environment: ${{ inputs.environment }}
-      action: ${{ inputs.action == 'DRY-RUN' && 'generate-iso' || 'generate-iso' }}
-    secrets:
-      REDHAT_PULL_SECRET: ${{ secrets.REDHAT_PULL_SECRET }}
-      SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
-
-  deploy-argocd:
-    name: 'Deploy ArgoCD (Phase 3)'
-    needs: [ci-validation, deploy-openshift]
-    if: |
-      always() &&
-      (needs.ci-validation.result == 'success' || needs.ci-validation.result == 'skipped' || inputs.skip_validation == true) &&
-      (needs.deploy-openshift.result == 'success' || needs.deploy-openshift.result == 'skipped') &&
-      contains(inputs.phases, 'argocd')
-    uses: ./.github/workflows/deploy-argocd.yaml
-    with:
-      environment: ${{ inputs.environment }}
-    secrets:
-      KUBECONFIG: ${{ secrets.KUBECONFIG }}
-
-  summary:
-    name: 'Pipeline Summary'
-    needs: [ci-validation, sync-images, deploy-ucs, deploy-openshift, deploy-argocd]
-    if: always()
-    runs-on: [self-hosted, linux, saif-github-runner]
-
-    steps:
-    - name: Pipeline Summary
-      run: |
-        echo "## End-to-End Pipeline Summary" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "| Phase | Stage | Status |" >> $GITHUB_STEP_SUMMARY
-        echo "|-------|-------|--------|" >> $GITHUB_STEP_SUMMARY
-        echo "| - | CI Validation | ${{ needs.ci-validation.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| 0b | Sync Images | ${{ needs.sync-images.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| 1 | Deploy UCS | ${{ needs.deploy-ucs.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| 2 | Deploy OpenShift | ${{ needs.deploy-openshift.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| 3 | Deploy ArgoCD | ${{ needs.deploy-argocd.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "**Action:** ${{ inputs.action }}" >> $GITHUB_STEP_SUMMARY
-        echo "**Phases:** ${{ inputs.phases }}" >> $GITHUB_STEP_SUMMARY
-        echo "**Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+      cluster_name: ${{ inputs.cluster_name }}
+      action: ${{ inputs.action }}
+    secrets: inherit

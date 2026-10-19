@@ -28,18 +28,18 @@ name: 'Validate Day 0 Prerequisites'
 #   openshift/validate → openshift/deploy → openshift/test
 #
 # Usage:
-#   gh workflow run validate-prerequisites.yaml -f cluster_name=ai-pod-1
+#   gh workflow run validate-prerequisites.yaml -f cluster_name=example-node-1
 #
 # Design Principles:
 #   - Validates manually-configured infrastructure only
-#   - Reads from rendered configs (openshift/data/$CLUSTER/)
+#   - Reads from rendered configs (data/openshift/$CLUSTER/)
 #   - Fail-fast: Stops before deployment if infrastructure not ready
 
 on:
   workflow_dispatch:
     inputs:
       cluster_name:
-        description: 'Cluster name (ai-pod-1, ai-pod-2, etc.)'
+        description: 'Cluster name (example-node-1, example-node-2, etc.)'
         required: true
         type: string
   workflow_call:
@@ -51,12 +51,16 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   validate:
     name: 'Prerequisites Validation'
-    runs-on: [self-hosted, linux, saif-github-runner]
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     container:
-      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
 
     steps:
     - name: Checkout
@@ -66,8 +70,8 @@ jobs:
       id: config
       run: |
         CLUSTER="${{ inputs.cluster_name }}"
-        INSTALL_CONFIG="openshift/data/$CLUSTER/install-config.yaml"
-        AGENT_CONFIG="openshift/data/$CLUSTER/agent-config.yaml"
+        INSTALL_CONFIG="data/openshift/$CLUSTER/install-config.yaml"
+        AGENT_CONFIG="data/openshift/$CLUSTER/agent-config.yaml"
 
         echo "## Cluster Configuration" >> $GITHUB_STEP_SUMMARY
         echo "Cluster: **$CLUSTER**" >> $GITHUB_STEP_SUMMARY
@@ -75,7 +79,7 @@ jobs:
         # Check rendered configs exist
         if [ ! -f "$INSTALL_CONFIG" ]; then
           echo "ERROR: Rendered config not found: $INSTALL_CONFIG"
-          echo "Run: python scripts/render-cluster-config.py $CLUSTER"
+          echo "Regenerate the selected cluster through its canonical Datacenter inputs."
           exit 1
         fi
 
@@ -84,8 +88,8 @@ jobs:
         BASE_DOMAIN=$(yq -r '.baseDomain' $INSTALL_CONFIG)
         MACHINE_CIDR=$(yq -r '.networking.machineNetwork[0].cidr' $INSTALL_CONFIG)
 
-        # Extract registry hostname from imageContentSources
-        REGISTRY_MIRROR=$(yq -r '.imageContentSources[0].mirrors[0]' $INSTALL_CONFIG)
+        # Extract registry hostname from imageDigestSources
+        REGISTRY_MIRROR=$(yq -r '.imageDigestSources[0].mirrors[0]' $INSTALL_CONFIG)
         REGISTRY_FQDN=$(echo $REGISTRY_MIRROR | cut -d':' -f1 | sed 's|/.*||')
 
         # Extract values from rendered agent-config.yaml
@@ -168,20 +172,27 @@ jobs:
 
     - name: Test Red Hat Registry Authentication
       shell: bash
+      env:
+        REDHAT_PULL_SECRET: ${{ secrets.REDHAT_PULL_SECRET }}
       run: |
         echo "## Red Hat Registry Authentication" >> $GITHUB_STEP_SUMMARY
         VALIDATION_FAILED=0
 
         # Write pull secret to temp file
-        echo '${{ secrets.REDHAT_PULL_SECRET }}' > /tmp/auth.json
+        umask 077
+        AUTH_FILE=$(mktemp "$RUNNER_TEMP/prerequisite-auth.XXXXXX")
+        trap 'rm -f -- "$AUTH_FILE"' EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        printf '%s' "$REDHAT_PULL_SECRET" > "$AUTH_FILE"
 
         # Check auth file format (redact sensitive values)
-        REGISTRIES=$(jq -r '.auths | keys | join(", ")' /tmp/auth.json 2>/dev/null || echo 'parse error')
+        REGISTRIES=$(jq -r '.auths | keys | join(", ")' "$AUTH_FILE" 2>/dev/null || echo 'parse error')
         echo "Auth file contains credentials for: $REGISTRIES" >> $GITHUB_STEP_SUMMARY
 
         # Test registry.redhat.io
         # Get credentials from pull secret
-        CREDS=$(jq -r '.auths."registry.redhat.io".auth // empty' /tmp/auth.json)
+        CREDS=$(jq -r '.auths."registry.redhat.io".auth // empty' "$AUTH_FILE")
         if [ -z "$CREDS" ]; then
           echo "❌ registry.redhat.io - no credentials in pull secret" >> $GITHUB_STEP_SUMMARY
           VALIDATION_FAILED=1
@@ -201,7 +212,7 @@ jobs:
         fi
 
         # Test quay.io
-        CREDS=$(jq -r '.auths."quay.io".auth // empty' /tmp/auth.json)
+        CREDS=$(jq -r '.auths."quay.io".auth // empty' "$AUTH_FILE")
         if [ -z "$CREDS" ]; then
           echo "❌ quay.io - no credentials in pull secret" >> $GITHUB_STEP_SUMMARY
           VALIDATION_FAILED=1
@@ -219,7 +230,7 @@ jobs:
         fi
 
         # Clean up
-        rm -f /tmp/auth.json
+        rm -f "$AUTH_FILE"
 
         if [ $VALIDATION_FAILED -eq 1 ]; then
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -355,37 +366,22 @@ jobs:
         VALIDATION_FAILED=0
         CLUSTER="${{ inputs.cluster_name }}"
 
-        # Check images-list.yaml
-        if [ -f mirror/images-list.yaml ]; then
-          echo "✅ mirror/images-list.yaml exists" >> $GITHUB_STEP_SUMMARY
-
-          # Validate YAML syntax
-          if yq -r '.' mirror/images-list.yaml > /dev/null 2>&1; then
-            echo "✅ mirror/images-list.yaml is valid YAML" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ mirror/images-list.yaml has YAML syntax errors" >> $GITHUB_STEP_SUMMARY
-            VALIDATION_FAILED=1
-          fi
-        else
-          echo "❌ mirror/images-list.yaml not found" >> $GITHUB_STEP_SUMMARY
-          VALIDATION_FAILED=1
-        fi
-
+        # Mirror recipes belong to Airgap. Compute validates selected rendered inputs.
         # Check rendered OpenShift configs
         for file in install-config.yaml agent-config.yaml; do
-          if [ -f "openshift/data/$CLUSTER/$file" ]; then
-            echo "✅ openshift/data/$CLUSTER/$file exists" >> $GITHUB_STEP_SUMMARY
+          if [ -f "data/openshift/$CLUSTER/$file" ]; then
+            echo "✅ data/openshift/$CLUSTER/$file exists" >> $GITHUB_STEP_SUMMARY
 
             # Validate YAML syntax
-            if yq -r '.' "openshift/data/$CLUSTER/$file" > /dev/null 2>&1; then
-              echo "✅ openshift/data/$CLUSTER/$file is valid YAML" >> $GITHUB_STEP_SUMMARY
+            if yq -r '.' "data/openshift/$CLUSTER/$file" > /dev/null 2>&1; then
+              echo "✅ data/openshift/$CLUSTER/$file is valid YAML" >> $GITHUB_STEP_SUMMARY
             else
-              echo "❌ openshift/data/$CLUSTER/$file has YAML syntax errors" >> $GITHUB_STEP_SUMMARY
+              echo "❌ data/openshift/$CLUSTER/$file has YAML syntax errors" >> $GITHUB_STEP_SUMMARY
               VALIDATION_FAILED=1
             fi
           else
-            echo "❌ openshift/data/$CLUSTER/$file not found" >> $GITHUB_STEP_SUMMARY
-            echo "   Run: python scripts/render-cluster-config.py $CLUSTER" >> $GITHUB_STEP_SUMMARY
+            echo "❌ data/openshift/$CLUSTER/$file not found" >> $GITHUB_STEP_SUMMARY
+            echo "   Regenerate the selected cluster through its canonical Datacenter inputs." >> $GITHUB_STEP_SUMMARY
             VALIDATION_FAILED=1
           fi
         done
@@ -425,6 +421,10 @@ jobs:
     - name: Validation Summary
       if: always()
       run: |
+        if [ "${{ job.status }}" != success ]; then
+          echo "Validation failed or was cancelled; inspect prior steps." >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+        fi
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "---" >> $GITHUB_STEP_SUMMARY
         echo "**✅ All Day 0 prerequisites validated for cluster: ${{ inputs.cluster_name }}**" >> $GITHUB_STEP_SUMMARY

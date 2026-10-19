@@ -44,13 +44,8 @@ on:
       server_target:
         description: 'Server profile(s) to manage'
         required: true
-        type: choice
-        options:
-          - saif-ai-pod-1
-          - saif-ai-pod-2
-          - saif-ai-pod-3
-          - saif-ai-pod-4
-          - ALL
+        type: string
+        default: 'ALL'
 
       domain_state:
         description: 'Domain profile (FI pair) - rarely changed'
@@ -89,16 +84,24 @@ on:
 permissions:
   contents: write
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   # Parse operation and map targets
   setup:
     name: 'Setup'
-    runs-on: [self-hosted, linux, saif-github-runner]
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     outputs:
       operation: ${{ steps.parse.outputs.operation }}
       profiles: ${{ steps.map.outputs.profiles }}
       profile_list: ${{ steps.map.outputs.profile_list }}
+    container:
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
       - name: Parse operation
         id: parse
         run: |
@@ -109,23 +112,19 @@ jobs:
 
       - name: Map server target to profiles
         id: map
+        env:
+          SERVER_TARGET: ${{ inputs.server_target }}
+          OPERATION: ${{ steps.parse.outputs.operation }}
+          DOMAIN_STATE: ${{ inputs.domain_state }}
         run: |
-          case "${{ inputs.server_target }}" in
-            "saif-ai-pod-1") PROFILES='["saif-ai-pod-1"]' ;;
-            "saif-ai-pod-2") PROFILES='["saif-ai-pod-2"]' ;;
-            "saif-ai-pod-3") PROFILES='["saif-ai-pod-3"]' ;;
-            "saif-ai-pod-4") PROFILES='["saif-ai-pod-4"]' ;;
-            "ALL") PROFILES='["saif-ai-pod-1","saif-ai-pod-2","saif-ai-pod-3","saif-ai-pod-4"]' ;;
-          esac
-          echo "profiles=$PROFILES" >> $GITHUB_OUTPUT
-          echo "profile_list=$(echo $PROFILES | tr -d '[]"' | tr ',' ' ')" >> $GITHUB_OUTPUT
+          python3 scripts/select-ucs-profiles.py
 
   # Safety check for Delete operations
   delete-guard:
     name: 'Delete Guard'
     needs: setup
     if: needs.setup.outputs.operation == 'Delete'
-    runs-on: [self-hosted, linux, saif-github-runner]
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     steps:
       - name: Verify Delete Confirmation
         run: |
@@ -159,9 +158,9 @@ jobs:
     name: 'Validate'
     needs: [setup, delete-guard]
     if: always() && inputs.skip_validation != true && (needs.delete-guard.result == 'success' || needs.delete-guard.result == 'skipped')
-    runs-on: [self-hosted, linux, saif-github-runner]
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     container:
-      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
     env:
       INTERSIGHT_API_KEY_ID: ${{ secrets.INTERSIGHT_API_KEY_ID }}
       INTERSIGHT_SECRET_KEY: ${{ secrets.INTERSIGHT_SECRET_KEY }}
@@ -236,9 +235,9 @@ jobs:
     name: 'Test'
     needs: [setup, execute]
     if: always() && needs.execute.result == 'success' && (needs.setup.outputs.operation == 'Activate' || needs.setup.outputs.operation == 'Stage') && inputs.skip_test != true
-    runs-on: [self-hosted, linux, saif-github-runner]
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     container:
-      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
     env:
       INTERSIGHT_API_KEY_ID: ${{ secrets.INTERSIGHT_API_KEY_ID }}
       INTERSIGHT_SECRET_KEY: ${{ secrets.INTERSIGHT_SECRET_KEY }}
@@ -253,15 +252,10 @@ jobs:
         run: |
           git pull origin ${{ github.ref_name }} || true
 
-      - name: Verify ucs-state.yaml
+      - name: Initialize UCS Test Results
         run: |
           echo "## UCS Test Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-
-          if [ ! -f "ucs-state.yaml" ]; then
-            echo "ucs-state.yaml not found" >> $GITHUB_STEP_SUMMARY
-            exit 1
-          fi
 
       - name: Verify Profile States
         run: |
@@ -279,6 +273,7 @@ jobs:
                 echo "- $PROFILE: Associated (deployed)" >> $GITHUB_STEP_SUMMARY
               else
                 echo "- $PROFILE: $API_STATE (expected Associated)" >> $GITHUB_STEP_SUMMARY
+              exit 1
               fi
             else
               echo "- $PROFILE: $API_STATE" >> $GITHUB_STEP_SUMMARY
@@ -295,18 +290,22 @@ jobs:
           PROFILES="${{ needs.setup.outputs.profile_list }}"
 
           for PROFILE in $PROFILES; do
-            MAC_ETH0=$(yq -r ".chassis.*.servers.$PROFILE.mac_eth0 // \"null\"" ucs-state.yaml 2>/dev/null | head -1)
-            MAC_ETH1=$(yq -r ".chassis.*.servers.$PROFILE.mac_eth1 // \"null\"" ucs-state.yaml 2>/dev/null | head -1)
+            PROFILE_DATA=$(isctl get server profile --filter "Name eq '$PROFILE'" -o json)
+            PROFILE_MOID=$(echo "$PROFILE_DATA" | jq -r '.[0].Moid // empty')
+            MAC_ETH0=$(isctl get vnic ethif --filter "Profile.Moid eq '$PROFILE_MOID' and Name eq 'eth0'" -o json | jq -r '.[0].MacAddress // "null"')
+            MAC_ETH1=$(isctl get vnic ethif --filter "Profile.Moid eq '$PROFILE_MOID' and Name eq 'eth1'" -o json | jq -r '.[0].MacAddress // "null"')
 
             if [ "$MAC_ETH0" != "null" ] && [ -n "$MAC_ETH0" ]; then
               echo "- $PROFILE eth0: $MAC_ETH0" >> $GITHUB_STEP_SUMMARY
             else
               echo "- $PROFILE eth0: not assigned" >> $GITHUB_STEP_SUMMARY
+              exit 1
             fi
 
             if [ "$MAC_ETH1" != "null" ] && [ -n "$MAC_ETH1" ]; then
               echo "- $PROFILE eth1: $MAC_ETH1" >> $GITHUB_STEP_SUMMARY
             else
               echo "- $PROFILE eth1: not assigned" >> $GITHUB_STEP_SUMMARY
+              exit 1
             fi
           done

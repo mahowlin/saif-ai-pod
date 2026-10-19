@@ -1,0 +1,78 @@
+# example-management — 3-node compact cluster for example-traffic POV
+#
+# Mode: compact-day1
+# Purpose: Management cluster hosting HCP tenants with Isovalent Cilium Enterprise
+#
+# This file defines WHAT to deploy. HOW to deploy is determined by
+# the mode-specific templates in modes/compact-day1/templates/.
+# Runtime hardware facts (MACs, NVMe serials) are discovered from
+# Intersight at render time — they are NOT defined here.
+
+cluster:
+  name: example-management
+  mode: compact-day1
+  openshift_version: "4.19"
+
+  # HA VIPs (keepalived + haproxy, enabled by platform: baremetal)
+  api_vip: 198.18.1.73
+  ingress_vip: 198.18.1.74
+
+  # 3 nodes — controllers doubling as workers
+  nodes:
+    - hostname: node-0.example-management.example.com
+      ucs_profile: saif-example-node-2
+      serial: SERIALNUMBER02
+      ip: 10.0.1.102
+      boot_disk_model: "CISCO_VD"      # M.2 RAID
+      role_label: "node-0 (rendezvous)"
+      gpu:
+        model: NVIDIA L40S
+        count: 1
+
+    - hostname: node-1.example-management.example.com
+      ucs_profile: saif-example-node-3
+      serial: SERIALNUMBER03
+      ip: 10.0.1.103
+      boot_disk_model: "Micron_5400_MTFD"  # Single M.2
+      role_label: "node-1"
+
+    - hostname: node-2.example-management.example.com
+      ucs_profile: saif-example-node-4
+      serial: SERIALNUMBER04
+      ip: 10.0.1.104
+      boot_disk_model: "Micron_5400_MTFD"  # Single M.2
+      role_label: "node-2"
+
+# Infrastructure — shared with SNO clusters (same SITE Lab environment)
+infrastructure:
+  base_domain: example.com
+  vlan: 100
+  network_cidr: 10.0.1.0/24
+  prefix_length: 24
+  gateway: 198.18.1.1
+  dns_servers:
+    - 10.0.0.53
+    - 10.0.0.54
+  registry:
+    hostname: registry.example.com
+    port: 5000
+
+  cluster_network:
+    cidr: 10.192.0.0/14
+    host_prefix: 23
+  service_network:
+    - 172.19.0.0/16
+
+  image_content_sources:
+    - source: quay.io/openshift-release-dev/ocp-release
+      mirrors:
+        - registry.example.com:5000/openshift/release-images
+    - source: quay.io/openshift-release-dev/ocp-v4.0-art-dev
+      mirrors:
+        - registry.example.com:5000/openshift/release
+    - source: registry.redhat.io/ubi9
+      mirrors:
+        - registry.example.com:5000/ubi9/ubi9
+    - source: quay.io/isovalent
+      mirrors:
+        - registry.example.com:5000/isovalent

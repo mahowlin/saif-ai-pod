@@ -30,7 +30,7 @@
 #   re-create mask symlinks on every config apply, blocking Day 2 reboots.
 #   See plans/CILIUM_REBOOT_GUARD_BUG_REVIEW.md for full analysis.
 #
-# Validated: ai-pod-1 Day 2 migration (2026-01-18), reboot survival (2026-01-19)
+# Validated: example-node-1 Day 2 migration (2026-01-18), reboot survival (2026-01-19)
 #
 apiVersion: machineconfiguration.openshift.io/v1
 kind: MachineConfig

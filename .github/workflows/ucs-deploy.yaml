@@ -46,14 +46,15 @@ on:
 
 defaults:
   run:
+    shell: bash
     working-directory: ucs/tf
 
 jobs:
   deploy:
     name: 'UCS ${{ inputs.operation }}'
-    runs-on: [self-hosted, linux, saif-github-runner]
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     container:
-      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
 
     env:
       TF_VAR_intersight_api_key_id: ${{ secrets.INTERSIGHT_API_KEY_ID }}
@@ -86,15 +87,12 @@ jobs:
     - name: Map server target to profiles
       id: profiles
       working-directory: ${{ github.workspace }}
+      env:
+        SERVER_TARGET: ${{ inputs.server_target }}
+        OPERATION: ${{ inputs.operation }}
+        DOMAIN_STATE: ${{ inputs.domain_state }}
       run: |
-        case "${{ inputs.server_target }}" in
-          "saif-ai-pod-1") PROFILES="saif-ai-pod-1" ;;
-          "saif-ai-pod-2") PROFILES="saif-ai-pod-2" ;;
-          "saif-ai-pod-3") PROFILES="saif-ai-pod-3" ;;
-          "saif-ai-pod-4") PROFILES="saif-ai-pod-4" ;;
-          "ALL") PROFILES="saif-ai-pod-1 saif-ai-pod-2 saif-ai-pod-3 saif-ai-pod-4" ;;
-        esac
-        echo "list=$PROFILES" >> $GITHUB_OUTPUT
+        python3 scripts/select-ucs-profiles.py
 
     # ============================================================
     # STAGE: Move profiles from inactive/ to active/
@@ -104,7 +102,10 @@ jobs:
       if: inputs.operation == 'Stage' || inputs.operation == 'Activate'
       working-directory: ${{ github.workspace }}
       shell: bash
+      env:
+        PROFILE_FILES: ${{ steps.profiles.outputs.files }}
       run: |
+        set -euo pipefail
         PROFILES="${{ steps.profiles.outputs.list }}"
 
         echo "" >> $GITHUB_STEP_SUMMARY
@@ -114,10 +115,9 @@ jobs:
         FILES_MOVED=0
 
         for PROFILE in $PROFILES; do
-          # Map profile name to filename (remove saif- prefix for file)
-          FILENAME="${PROFILE#saif-}.ezi.yaml"
-          ACTIVE_PATH="ucs/config/profiles/active/$FILENAME"
-          INACTIVE_PATH="ucs/config/profiles/inactive/$FILENAME"
+          FILENAME=$(PROFILE="$PROFILE" python3 -c 'import json,os; print(json.loads(os.environ["PROFILE_FILES"])[os.environ["PROFILE"]])')
+          ACTIVE_PATH="ucs/defaults/profiles/active/$FILENAME"
+          INACTIVE_PATH="ucs/defaults/profiles/inactive/$FILENAME"
 
           if [ -f "$INACTIVE_PATH" ]; then
             echo "Moving $FILENAME to active/"
@@ -128,7 +128,8 @@ jobs:
             echo "$FILENAME already in active/"
             echo "- $PROFILE: Already in active/" >> $GITHUB_STEP_SUMMARY
           else
-            echo "WARNING: $FILENAME not found in active/ or inactive/"
+            echo "::error::$FILENAME not found in active/ or inactive/"
+            exit 1
             echo "- $PROFILE: File not found" >> $GITHUB_STEP_SUMMARY
           fi
         done
@@ -140,7 +141,7 @@ jobs:
           git commit -m "Move $FILES_MOVED profile(s) to active/ for staging"
           for attempt in 1 2 3; do
             git rebase --abort 2>/dev/null || true
-            if git pull --rebase origin main && git push; then break; fi
+            if git pull --rebase origin "$GITHUB_REF_NAME" && git push; then break; fi
             if [ $attempt -eq 3 ]; then echo "::error::Push failed after 3 attempts"; exit 1; fi
             echo "Push race (attempt $attempt/3), retrying..."
             sleep $((attempt * 2))
@@ -157,7 +158,10 @@ jobs:
       if: inputs.operation == 'Delete'
       working-directory: ${{ github.workspace }}
       shell: bash
+      env:
+        PROFILE_FILES: ${{ steps.profiles.outputs.files }}
       run: |
+        set -euo pipefail
         PROFILES="${{ steps.profiles.outputs.list }}"
 
         # -----------------------------------------------------------
@@ -167,51 +171,7 @@ jobs:
         echo "### Server Unassign (Pre-Delete)" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
 
-        for PROFILE in $PROFILES; do
-          MOID=$(isctl get server profile --filter "Name eq '$PROFILE'" -o json 2>/dev/null | jq -r '.[0].Moid // empty')
-          if [ -n "$MOID" ] && [ "$MOID" != "null" ]; then
-            STATE=$(isctl get server profile --filter "Name eq '$PROFILE'" -o json | jq -r '.[0].ConfigContext.ConfigState // "unknown"')
-
-            if [ "$STATE" == "Not-assigned" ]; then
-              echo "- $PROFILE: Already unassigned" >> $GITHUB_STEP_SUMMARY
-            elif [ "$STATE" == "Associated" ] || [ "$STATE" == "Assigned" ]; then
-              echo "Unassigning $PROFILE (state: $STATE)..."
-              isctl update server profile moid $MOID --Action Unassign || true
-              echo "- $PROFILE: Unassign initiated" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "- $PROFILE: State is $STATE, skipping unassign" >> $GITHUB_STEP_SUMMARY
-            fi
-          else
-            echo "- $PROFILE: Not found in Intersight" >> $GITHUB_STEP_SUMMARY
-          fi
-        done
-
-        # Wait for unassign to complete
-        MAX_WAIT=600
-        for PROFILE in $PROFILES; do
-          MOID=$(isctl get server profile --filter "Name eq '$PROFILE'" -o json 2>/dev/null | jq -r '.[0].Moid // empty')
-          if [ -z "$MOID" ] || [ "$MOID" == "null" ]; then
-            continue
-          fi
-
-          ELAPSED=0
-          while [ $ELAPSED -lt $MAX_WAIT ]; do
-            STATE=$(isctl get server profile --filter "Name eq '$PROFILE'" -o json 2>/dev/null | jq -r '.[0].ConfigContext.ConfigState // "Not-assigned"')
-
-            if [ "$STATE" == "Not-assigned" ]; then
-              echo "$PROFILE unassigned"
-              break
-            fi
-
-            echo "[$ELAPSED s] $PROFILE: $STATE (waiting for Not-assigned)"
-            sleep 30
-            ELAPSED=$((ELAPSED + 30))
-          done
-
-          if [ $ELAPSED -ge $MAX_WAIT ]; then
-            echo "WARNING: Timeout waiting for $PROFILE to unassign"
-          fi
-        done
+        python3 scripts/unassign-ucs-profiles.py $PROFILES
 
         # -----------------------------------------------------------
         # Step 2: Move profile files to inactive/
@@ -223,10 +183,9 @@ jobs:
         FILES_MOVED=0
 
         for PROFILE in $PROFILES; do
-          # Map profile name to filename (remove saif- prefix for file)
-          FILENAME="${PROFILE#saif-}.ezi.yaml"
-          ACTIVE_PATH="ucs/config/profiles/active/$FILENAME"
-          INACTIVE_PATH="ucs/config/profiles/inactive/$FILENAME"
+          FILENAME=$(PROFILE="$PROFILE" python3 -c 'import json,os; print(json.loads(os.environ["PROFILE_FILES"])[os.environ["PROFILE"]])')
+          ACTIVE_PATH="ucs/defaults/profiles/active/$FILENAME"
+          INACTIVE_PATH="ucs/defaults/profiles/inactive/$FILENAME"
 
           if [ -f "$ACTIVE_PATH" ]; then
             echo "Moving $FILENAME to inactive/"
@@ -237,7 +196,8 @@ jobs:
             echo "$FILENAME already in inactive/"
             echo "- $PROFILE: Already in inactive/" >> $GITHUB_STEP_SUMMARY
           else
-            echo "WARNING: $FILENAME not found in active/ or inactive/"
+            echo "::error::$FILENAME not found in active/ or inactive/"
+            exit 1
             echo "- $PROFILE: File not found" >> $GITHUB_STEP_SUMMARY
           fi
         done
@@ -249,7 +209,7 @@ jobs:
           git commit -m "Move $FILES_MOVED profile(s) to inactive/ for deletion"
           for attempt in 1 2 3; do
             git rebase --abort 2>/dev/null || true
-            if git pull --rebase origin main && git push; then break; fi
+            if git pull --rebase origin "$GITHUB_REF_NAME" && git push; then break; fi
             if [ $attempt -eq 3 ]; then echo "::error::Push failed after 3 attempts"; exit 1; fi
             echo "Push race (attempt $attempt/3), retrying..."
             sleep $((attempt * 2))
@@ -298,16 +258,19 @@ jobs:
     # ============================================================
 
     - name: Deploy Domain
-      if: inputs.domain_state == 'Deployed'
+      if: inputs.domain_state == 'Deployed' && (inputs.operation == 'Stage' || inputs.operation == 'Activate')
       working-directory: ${{ github.workspace }}
       shell: bash
+      env:
+        DOMAIN_PROFILE: ${{ steps.profiles.outputs.domain }}
       run: |
+        set -euo pipefail
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "### Domain Deployment" >> $GITHUB_STEP_SUMMARY
 
         FI_MOIDS=$(isctl get fabric switchprofile \
-          --filter "contains(Name,'saif-ai-pod-dom')" \
-          -o json | jq -r '.[].Moid')
+          --filter "startswith(Name,'${DOMAIN_PROFILE}-')" \
+          -o json | jq -er 'if type == "array" and length == 2 and all(.[]; .Moid | type == "string") then .[].Moid else error("domain FI pair observation failed") end')
 
         if [ -z "$FI_MOIDS" ]; then
           echo "No domain profiles found" >> $GITHUB_STEP_SUMMARY
@@ -325,8 +288,8 @@ jobs:
         ELAPSED=0
         while [ $ELAPSED -lt $MAX_WAIT ]; do
           STATE=$(isctl get fabric switchclusterprofile \
-            --filter "contains(Name,'saif-ai-pod-dom')" \
-            -o json | jq -r '.[0].ConfigContext.ConfigState // "unknown"')
+            --filter "Name eq '${DOMAIN_PROFILE}'" \
+            -o json | jq -er 'if type == "array" and length == 1 then .[0].ConfigContext.ConfigState | select(type == "string" and length > 0) else error("domain state observation failed") end')
           echo "[$ELAPSED s] Domain state: $STATE"
 
           if [ "$STATE" == "Associated" ]; then
@@ -349,21 +312,24 @@ jobs:
         fi
 
     - name: Unassign Domain
-      if: inputs.domain_state == 'Unassigned'
+      if: inputs.domain_state == 'Unassigned' && (inputs.operation == 'Deactivate' || inputs.operation == 'Delete')
       working-directory: ${{ github.workspace }}
       shell: bash
+      env:
+        DOMAIN_PROFILE: ${{ steps.profiles.outputs.domain }}
       run: |
+        set -euo pipefail
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "### Domain Unassign" >> $GITHUB_STEP_SUMMARY
 
         FI_MOIDS=$(isctl get fabric switchprofile \
-          --filter "contains(Name,'saif-ai-pod-dom')" \
-          -o json 2>/dev/null | jq -r '.[].Moid // empty')
+          --filter "startswith(Name,'${DOMAIN_PROFILE}-')" \
+          -o json 2>/dev/null | jq -er 'if type == "array" and length > 0 then .[].Moid | select(type == "string" and length > 0) else error("missing domain profiles") end')
 
         for MOID in $FI_MOIDS; do
           if [ -n "$MOID" ]; then
             echo "Unassigning FI $MOID..."
-            isctl update fabric switchprofile moid $MOID --Action Unassign || true
+            isctl update fabric switchprofile moid $MOID --Action Unassign
           fi
         done
 
@@ -372,11 +338,11 @@ jobs:
         ELAPSED=0
         while [ $ELAPSED -lt $MAX_WAIT ]; do
           STATE=$(isctl get fabric switchclusterprofile \
-            --filter "contains(Name,'saif-ai-pod-dom')" \
-            -o json 2>/dev/null | jq -r '.[0].ConfigContext.ConfigState // "Not-assigned"')
+            --filter "Name eq '${DOMAIN_PROFILE}'" \
+            -o json 2>/dev/null | jq -er 'if type == "array" and length == 1 then .[0].ConfigContext.ConfigState | select(type == "string" and length > 0) else error("ambiguous domain state") end')
           echo "[$ELAPSED s] Domain state: $STATE"
 
-          if [ "$STATE" == "Not-assigned" ] || [ -z "$STATE" ]; then
+          if [ "$STATE" == "Not-assigned" ]; then
             echo "Domain unassigned successfully" >> $GITHUB_STEP_SUMMARY
             break
           fi
@@ -384,6 +350,11 @@ jobs:
           sleep 30
           ELAPSED=$((ELAPSED + 30))
         done
+
+        if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
+          echo "::error::Timeout waiting for domain unassignment"
+          exit 1
+        fi
 
     # ============================================================
     # SERVER OPERATIONS (Activate, Deactivate, Delete)
@@ -493,93 +464,7 @@ jobs:
 
         PROFILES="${{ steps.profiles.outputs.list }}"
 
-        for PROFILE in $PROFILES; do
-          MOID=$(isctl get server profile --filter "Name eq '$PROFILE'" -o json 2>/dev/null | jq -r '.[0].Moid // empty')
-          if [ -n "$MOID" ] && [ "$MOID" != "null" ]; then
-            STATE=$(isctl get server profile --filter "Name eq '$PROFILE'" -o json | jq -r '.[0].ConfigContext.ConfigState // "unknown"')
-
-            if [ "$STATE" == "Not-assigned" ]; then
-              echo "- $PROFILE: Already unassigned" >> $GITHUB_STEP_SUMMARY
-              continue
-            fi
-
-            echo "Unassigning $PROFILE..."
-            isctl update server profile moid $MOID --Action Unassign || true
-          else
-            echo "- $PROFILE: Not found (skipped)" >> $GITHUB_STEP_SUMMARY
-          fi
-        done
-
-        # Wait for Not-assigned state
-        MAX_WAIT=600
-        for PROFILE in $PROFILES; do
-          ELAPSED=0
-          while [ $ELAPSED -lt $MAX_WAIT ]; do
-            STATE=$(isctl get server profile --filter "Name eq '$PROFILE'" -o json 2>/dev/null | jq -r '.[0].ConfigContext.ConfigState // "Not-assigned"')
-            echo "[$ELAPSED s] $PROFILE: $STATE"
-
-            if [ "$STATE" == "Not-assigned" ] || [ -z "$STATE" ]; then
-              echo "- $PROFILE: Unassigned" >> $GITHUB_STEP_SUMMARY
-              break
-            fi
-
-            sleep 30
-            ELAPSED=$((ELAPSED + 30))
-          done
-
-          if [ $ELAPSED -ge $MAX_WAIT ]; then
-            echo "- $PROFILE: Timeout waiting for unassign" >> $GITHUB_STEP_SUMMARY
-            exit 1
-          fi
-        done
-
-    # ============================================================
-    # STATE UPDATE (always runs)
-    # ============================================================
-
-    - name: Update UCS State
-      if: always()
-      working-directory: ${{ github.workspace }}
-      run: |
-        python3 scripts/update-ucs-state.py
-
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "### UCS State" >> $GITHUB_STEP_SUMMARY
-        echo '```yaml' >> $GITHUB_STEP_SUMMARY
-        cat ucs-state.yaml >> $GITHUB_STEP_SUMMARY
-        echo '```' >> $GITHUB_STEP_SUMMARY
-
-        # Commit if changed
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        git add ucs-state.yaml
-        if git diff --staged --quiet; then
-          echo "No state changes"
-        else
-          # Save generated state for conflict-safe push (concurrent runs modify same file)
-          cp ucs-state.yaml /tmp/ucs-state-ours.yaml
-          git commit -m "Update UCS state after ${{ inputs.operation }}"
-          for attempt in 1 2 3; do
-            if git push origin main 2>/dev/null; then break; fi
-            if [ $attempt -eq 3 ]; then
-              git push origin main || { echo "::error::Push failed after 3 attempts"; exit 1; }
-              break
-            fi
-            echo "Push race (attempt $attempt/3), recovering..."
-            git rebase --abort 2>/dev/null || true
-            git fetch origin main
-            git reset --hard origin/main
-            cp /tmp/ucs-state-ours.yaml ucs-state.yaml
-            git add ucs-state.yaml
-            if git diff --staged --quiet; then
-              echo "No state changes after merge with remote"
-              break
-            fi
-            git commit -m "Update UCS state after ${{ inputs.operation }}"
-            sleep $((attempt * 2))
-          done
-          rm -f /tmp/ucs-state-ours.yaml
-        fi
+        python3 scripts/unassign-ucs-profiles.py $PROFILES
 
     - name: Summary Footer
       run: |

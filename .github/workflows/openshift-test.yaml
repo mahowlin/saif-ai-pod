@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       cluster_name:
-        description: 'Cluster name (ai-pod-1, ai-pod-2, etc.)'
+        description: 'Cluster name (example-node-1, example-node-2, etc.)'
         required: true
         type: string
       kubeconfig_path:
@@ -53,12 +53,16 @@ on:
         default: ''
 
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   test:
     name: 'Test OpenShift Deployment'
-    runs-on: [self-hosted, linux, saif-github-runner]
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     container:
-      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
 
     steps:
     - name: Checkout
@@ -66,43 +70,67 @@ jobs:
 
     - name: Setup Kubeconfig
       env:
+        PROVIDED_KUBECONFIG: ${{ inputs.kubeconfig_path }}
+        KUBECONFIG_REPOSITORY: ${{ vars.KUBECONFIG_REPOSITORY }}
+        KUBECONFIG_REF: ${{ vars.KUBECONFIG_REF || 'main' }}
         KUBECONFIG_REPO_TOKEN: ${{ secrets.KUBECONFIG_REPO_TOKEN }}
+        CLUSTER: ${{ inputs.cluster_name }}
       run: |
-        echo "## Cluster Connection" >> $GITHUB_STEP_SUMMARY
+        set -euo pipefail
+        if [ -n "$PROVIDED_KUBECONFIG" ]; then
+          test -f "$PROVIDED_KUBECONFIG"
+          echo "KUBECONFIG=$(realpath "$PROVIDED_KUBECONFIG")" >> "$GITHUB_ENV"
+          exit 0
+        fi
+        [[ "$KUBECONFIG_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+        [[ "$CLUSTER" =~ ^[A-Za-z0-9_.-]+$ ]]
+        test -n "$KUBECONFIG_REPO_TOKEN"
+        umask 077
+        PRIVATE_DIR=$(mktemp -d "$RUNNER_TEMP/cluster-test.XXXXXX")
+        echo "TEST_PRIVATE_DIR=$PRIVATE_DIR" >> "$GITHUB_ENV"
+        trap 'rm -rf "$PRIVATE_DIR"' ERR
+        export GIT_CONFIG_COUNT=1
+        export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+        export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$KUBECONFIG_REPO_TOKEN" | base64 | tr -d '\n')"
+        git clone --depth 1 --branch "$KUBECONFIG_REF" "https://github.com/$KUBECONFIG_REPOSITORY.git" "$PRIVATE_DIR/repo"
+        test -f "$PRIVATE_DIR/repo/clusters/$CLUSTER/kubeconfig"
+        cp "$PRIVATE_DIR/repo/clusters/$CLUSTER/kubeconfig" "$PRIVATE_DIR/kubeconfig"
+        chmod 600 "$PRIVATE_DIR/kubeconfig"
+        rm -rf "$PRIVATE_DIR/repo"
+        echo "KUBECONFIG=$PRIVATE_DIR/kubeconfig" >> "$GITHUB_ENV"
+
+    # =========================================================================
+    # Contract Verification (cluster config → deployed state)
+    # =========================================================================
+
+    - name: Collect Cluster Snapshot
+      shell: bash
+      run: |
         CLUSTER="${{ inputs.cluster_name }}"
+        mkdir -p tests/reports
+        python3 tests/collect_snapshot.py "$CLUSTER" \
+          --output "tests/reports/cluster-state-${CLUSTER}.json"
 
-        # Fetch kubeconfig from kubeconfig storage repo
-        if [ -z "$KUBECONFIG_REPO_TOKEN" ]; then
-          echo "❌ KUBECONFIG_REPO_TOKEN not configured" >> $GITHUB_STEP_SUMMARY
-          exit 1
-        fi
+    - name: Run Contract Tests
+      shell: bash
+      run: |
+        CLUSTER="${{ inputs.cluster_name }}"
+        python3 -m pytest tests/test_cluster_contract.py \
+          --cluster-name "$CLUSTER" \
+          --snapshot-file "tests/reports/cluster-state-${CLUSTER}.json" \
+          --junitxml="tests/reports/junit-${CLUSTER}.xml" \
+          -v
+        cat "tests/reports/contract-report-${CLUSTER}.md" >> $GITHUB_STEP_SUMMARY
 
-        echo "Fetching kubeconfig from kubeconfig storage repo..."
-
-        KUBECONFIG_DIR="$HOME/.kube"
-        mkdir -p "$KUBECONFIG_DIR"
-
-        # Clone the kubeconfigs repo
-        git clone --depth 1 \
-          # Configure this URL for your kubeconfig storage repository
-          "https://x-access-token:${KUBECONFIG_REPO_TOKEN}@github.com/mahowlin/saif-kubeconfigs.git" \
-          /tmp/kubeconfigs 2>/dev/null
-
-        KUBECONFIG_FILE="/tmp/kubeconfigs/clusters/${CLUSTER}/kubeconfig"
-
-        if [ ! -f "$KUBECONFIG_FILE" ]; then
-          echo "❌ Kubeconfig not found in repo" >> $GITHUB_STEP_SUMMARY
-          echo "   Expected: clusters/${CLUSTER}/kubeconfig" >> $GITHUB_STEP_SUMMARY
-          echo "   Ensure Deploy job committed kubeconfig before running Test" >> $GITHUB_STEP_SUMMARY
-          rm -rf /tmp/kubeconfigs
-          exit 1
-        fi
-
-        cp "$KUBECONFIG_FILE" "$KUBECONFIG_DIR/config-$CLUSTER"
-        rm -rf /tmp/kubeconfigs
-
-        echo "KUBECONFIG=$KUBECONFIG_DIR/config-$CLUSTER" >> $GITHUB_ENV
-        echo "✅ Kubeconfig retrieved from kubeconfig storage repo" >> $GITHUB_STEP_SUMMARY
+    - name: Upload Contract Artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: contract-report-${{ inputs.cluster_name }}
+        path: |
+          tests/reports/cluster-state-${{ inputs.cluster_name }}.json
+          tests/reports/contract-report-${{ inputs.cluster_name }}.md
+          tests/reports/junit-${{ inputs.cluster_name }}.xml
 
     # =========================================================================
     # Core Cluster Health (Agent-Based Installer)
@@ -130,12 +158,31 @@ jobs:
       run: |
         echo "## Nodes Status" >> $GITHUB_STEP_SUMMARY
 
+        CLUSTER="${{ inputs.cluster_name }}"
+        CLUSTER_DEF="data/openshift/${CLUSTER}/metadata.yaml"
+
+        # Get expected node count from cluster definition (if available)
+        EXPECTED_NODES=""
+        if [ -f "$CLUSTER_DEF" ]; then
+          EXPECTED_NODES=$(yq -r '.nodes | length' "$CLUSTER_DEF" 2>/dev/null || echo "")
+        fi
+
         # Get nodes status
         TOTAL_NODES=$(oc get nodes --no-headers | wc -l)
         READY_NODES=$(oc get nodes --no-headers | grep -c " Ready" || echo "0")
 
         echo "Total Nodes: $TOTAL_NODES" >> $GITHUB_STEP_SUMMARY
         echo "Ready Nodes: $READY_NODES" >> $GITHUB_STEP_SUMMARY
+
+        # Validate node count matches cluster definition
+        if [ -n "$EXPECTED_NODES" ] && [ "$EXPECTED_NODES" != "null" ]; then
+          if [ "$TOTAL_NODES" -eq "$EXPECTED_NODES" ]; then
+            echo "✅ Node count matches cluster definition ($EXPECTED_NODES)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Node count mismatch: expected $EXPECTED_NODES from cluster def, got $TOTAL_NODES" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+        fi
 
         if [ "$READY_NODES" -eq "$TOTAL_NODES" ] && [ "$TOTAL_NODES" -gt 0 ]; then
           echo "✅ All nodes are Ready" >> $GITHUB_STEP_SUMMARY
@@ -182,38 +229,34 @@ jobs:
 
     - name: Test Cilium CNI
       run: |
-        echo "## Cilium CNI Status" >> $GITHUB_STEP_SUMMARY
-
-        # Cilium is deployed at Day 1 by the Agent-Based Installer
-        CILIUM_PODS=$(oc get pods -n openshift-cilium -o custom-columns=NAME:.metadata.name,STATUS:.status.phase --no-headers 2>/dev/null | wc -l || echo "0")
-
-        if [ "$CILIUM_PODS" -gt 0 ]; then
-          RUNNING_CILIUM=$(oc get pods -n openshift-cilium --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l || echo "0")
-          echo "Cilium Pods: $RUNNING_CILIUM/$CILIUM_PODS running" >> $GITHUB_STEP_SUMMARY
-
-          if [ "$RUNNING_CILIUM" -eq "$CILIUM_PODS" ]; then
-            echo "✅ All Cilium pods are running" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "⚠️  Some Cilium pods are not running" >> $GITHUB_STEP_SUMMARY
-          fi
-        else
-          echo "⚠️  Cilium pods not found (may not be deployed yet)" >> $GITHUB_STEP_SUMMARY
+        set -euo pipefail
+        NETWORK_TYPE=$(yq -er '.networkType' "data/openshift/${{ inputs.cluster_name }}/metadata.yaml")
+        if [ "$NETWORK_TYPE" != Cilium ]; then
+          echo 'Cilium is not selected by this cluster metadata.' >> "$GITHUB_STEP_SUMMARY"
+          exit 0
         fi
+        CILIUM_NAMESPACE=""
+        for namespace in cilium openshift-cilium; do
+          if oc get namespace "$namespace" >/dev/null 2>&1; then
+            CILIUM_NAMESPACE="$namespace"
+            break
+          fi
+        done
+        test -n "$CILIUM_NAMESPACE"
+        oc get pods -n "$CILIUM_NAMESPACE" -l app.kubernetes.io/part-of=cilium -o json | jq -e '
+          (.items | length) > 0 and all(.items[];
+            any(.status.conditions[]; .type == "Ready" and .status == "True"))'
+        echo 'Observed selected Cilium pods Ready.' >> "$GITHUB_STEP_SUMMARY"
 
     - name: Test MachineConfigPools
       run: |
-        echo "## MachineConfigPools Status" >> $GITHUB_STEP_SUMMARY
-
-        # Check MCP status
-        oc get mcp --no-headers 2>/dev/null | while read name config updated updating degraded count ready ucount dcount age; do
-          if [ "$degraded" = "True" ]; then
-            echo "❌ MCP $name is degraded" >> $GITHUB_STEP_SUMMARY
-          elif [ "$updating" = "True" ]; then
-            echo "⚠️  MCP $name is updating" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "✅ MCP $name: $ready/$count ready" >> $GITHUB_STEP_SUMMARY
-          fi
-        done
+        set -euo pipefail
+        oc get mcp -o json | jq -e '
+          (.items | length) > 0 and all(.items[];
+            any(.status.conditions[]; .type == "Updated" and .status == "True") and
+            any(.status.conditions[]; .type == "Degraded" and .status == "False") and
+            .status.readyMachineCount == .status.machineCount)'
+        echo 'MachineConfigPools observed ready and not degraded.' >> "$GITHUB_STEP_SUMMARY"
 
     - name: Test etcd Health
       run: |
@@ -224,18 +267,20 @@ jobs:
 
         if [ -n "$ETCD_POD" ]; then
           # Check etcd endpoint health
-          ETCD_HEALTH=$(oc rsh -n openshift-etcd -c etcdctl $ETCD_POD etcdctl endpoint health --cluster 2>/dev/null || echo "error")
+          ETCD_HEALTH=$(oc rsh -n openshift-etcd -c etcdctl $ETCD_POD etcdctl endpoint health --cluster 2>/dev/null)
 
-          if echo "$ETCD_HEALTH" | grep -q "is healthy"; then
+          if [ -n "$ETCD_HEALTH" ] && ! echo "$ETCD_HEALTH" | grep -qv "is healthy"; then
             echo "✅ etcd cluster is healthy" >> $GITHUB_STEP_SUMMARY
             echo "$ETCD_HEALTH" | while read line; do
               echo "   $line" >> $GITHUB_STEP_SUMMARY
             done
           else
             echo "❌ etcd health check failed" >> $GITHUB_STEP_SUMMARY
+            exit 1
           fi
         else
           echo "⚠️  etcd pod not found" >> $GITHUB_STEP_SUMMARY
+          exit 1
         fi
 
     - name: Test Network Connectivity
@@ -285,31 +330,16 @@ jobs:
 
     - name: Test CatalogSources
       run: |
-        echo "## CatalogSources Status" >> $GITHUB_STEP_SUMMARY
-
-        # Check CatalogSource pods in openshift-marketplace
-        CATALOG_PODS=$(oc get pods -n openshift-marketplace --no-headers 2>/dev/null | wc -l || echo "0")
-        RUNNING_CATALOG=$(oc get pods -n openshift-marketplace --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l || echo "0")
-
-        # Check for ImagePullBackOff specifically (indicates disconnected registry issues)
-        PULL_ERRORS=$(oc get pods -n openshift-marketplace --no-headers 2>/dev/null | \
-          grep -E "ImagePullBackOff|ErrImagePull" | wc -l || echo "0")
-
-        echo "Marketplace Pods: $RUNNING_CATALOG/$CATALOG_PODS running" >> $GITHUB_STEP_SUMMARY
-
-        if [ "$PULL_ERRORS" -gt 0 ]; then
-          echo "❌ CatalogSource image pull failures detected" >> $GITHUB_STEP_SUMMARY
-          echo "   This indicates disconnected registry configuration issues" >> $GITHUB_STEP_SUMMARY
-          oc get pods -n openshift-marketplace --no-headers 2>/dev/null | \
-            grep -E "ImagePullBackOff|ErrImagePull" | while read line; do
-            echo "- $line" >> $GITHUB_STEP_SUMMARY
-          done
-          exit 1
-        elif [ "$RUNNING_CATALOG" -eq "$CATALOG_PODS" ] && [ "$CATALOG_PODS" -gt 0 ]; then
-          echo "✅ All CatalogSource pods are running" >> $GITHUB_STEP_SUMMARY
-        else
-          echo "⚠️  Some CatalogSource pods not running" >> $GITHUB_STEP_SUMMARY
+        set -euo pipefail
+        CATALOGS=$(oc get catalogsource -n openshift-marketplace -o json)
+        REQUIRED=$(yq -r '(.capabilities // []) | contains(["disconnectedCatalogs"])' "data/openshift/${{ inputs.cluster_name }}/metadata.yaml")
+        if [ "$REQUIRED" = false ] && [ "$(printf '%s' "$CATALOGS" | jq '.items | length')" -eq 0 ]; then
+          echo 'No CatalogSources selected or observed.' >> "$GITHUB_STEP_SUMMARY"
+          exit 0
         fi
+        printf '%s' "$CATALOGS" | jq -e '(.items | length) > 0 and all(.items[];
+          .status.connectionState.lastObservedState == "READY")'
+        echo 'Observed selected CatalogSources READY.' >> "$GITHUB_STEP_SUMMARY"
 
     # =========================================================================
     # Post-Install Verification (IDMS, Sealed Secrets, ArgoCD)
@@ -372,7 +402,7 @@ jobs:
 
         # Check saif-apps Application exists and points to correct cluster
         CURRENT_PATH=$(oc get application saif-apps -n openshift-gitops -o jsonpath='{.spec.source.path}' 2>/dev/null || echo "")
-        EXPECTED_PATH="clusters/${CLUSTER}"
+        EXPECTED_PATH=$(yq -er '.gitopsBootstrapPath' "data/openshift/$CLUSTER/metadata.yaml")
 
         if [ "$CURRENT_PATH" = "$EXPECTED_PATH" ]; then
           echo "✅ App-of-Apps configured (path: $CURRENT_PATH)" >> $GITHUB_STEP_SUMMARY
@@ -423,3 +453,13 @@ jobs:
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "Core cluster healthy. Post-install (IDMS, Sealed Secrets, ArgoCD) verified." >> $GITHUB_STEP_SUMMARY
         echo "Workload health tested separately by saif-gitops." >> $GITHUB_STEP_SUMMARY
+
+    - name: Clean workflow-owned test authentication
+      if: always()
+      run: |
+        if [ -n "${TEST_PRIVATE_DIR:-}" ]; then
+          case "$TEST_PRIVATE_DIR" in
+            "$RUNNER_TEMP"/cluster-test.*) rm -rf "$TEST_PRIVATE_DIR" ;;
+            *) echo 'Refusing cleanup of an unowned path' >&2; exit 1 ;;
+          esac
+        fi

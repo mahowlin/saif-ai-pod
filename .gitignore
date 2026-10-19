@@ -28,10 +28,10 @@ auth/
 # Ansible
 *.retry
 
-# Python
-__pycache__/
-*.pyc
-.venv/
+# Test reports
+tests/reports/
 
-# Claude
-.claude/
+# Local Python checks
+__pycache__/
+*.py[cod]
+.venv/

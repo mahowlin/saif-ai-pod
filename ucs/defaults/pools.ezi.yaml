@@ -1,0 +1,73 @@
+# Copyright (c) 2026 Cisco and/or its affiliates.
+#
+# This software is licensed to you under the terms of the Cisco Sample
+# Code License, Version 1.1 (the "License"). You may obtain a copy of the
+# License at
+#
+#                https://developer.cisco.com/docs/licenses
+#
+# All use of the material herein must be in accordance with the terms of
+# the License. All rights not expressly granted by the License are
+# reserved. Unless required by applicable law or agreed to separately in
+# writing, software distributed under the License is distributed on an "AS
+# IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied.
+
+---
+#========================================
+#   Pools - SAIF AI Pod
+#   Naming convention: saif-example-node-{pool-type}
+#========================================
+cpa-infra:
+  pools:
+    #----------------------------------------
+    # UUID Pool - For server identity
+    #----------------------------------------
+    uuid:
+      - name: saif-example-node-uuid-pool
+        description: "SAIF AI Pod UUID Pool for server identity"
+        assignment_order: sequential
+        prefix: "000025B5-0000-0000"
+        uuid_blocks:
+          - from: "0000-000000000001"
+            size: 16
+
+    #----------------------------------------
+    # MAC Pool - For vNIC MAC addresses
+    #----------------------------------------
+    mac:
+      - name: saif-example-node-mac-pool
+        description: "SAIF AI Pod MAC Pool for vNICs"
+        assignment_order: sequential
+        mac_blocks:
+          - from: "00:00:00:00:00:10"
+            size: 32
+
+    #----------------------------------------
+    # Inband IP Pool - VLAN 2134 (dc-inb-mgmt)
+    #----------------------------------------
+    ip:
+      - name: saif-example-node-inband-ip-pool
+        description: "SAIF AI Pod Inband Management IP Pool - VLAN 2134"
+        assignment_order: sequential
+        ipv4_blocks:
+          - from: 10.0.2.6
+            size: 4
+        ipv4_configuration:
+          gateway: 10.0.2.1
+          netmask: 255.255.255.0
+          primary_dns: 10.0.3.1
+
+      #----------------------------------------
+      # OOB IP Pool - VLAN 2130 (saif-oob-mgmt)
+      #----------------------------------------
+      - name: saif-example-node-oob-ip-pool
+        description: "SAIF AI Pod Out-of-Band Management IP Pool - VLAN 2130"
+        assignment_order: sequential
+        ipv4_blocks:
+          - from: 10.0.0.20
+            size: 4
+        ipv4_configuration:
+          gateway: 10.0.0.1
+          netmask: 255.255.254.0
+          primary_dns: 10.0.3.1

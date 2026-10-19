@@ -28,14 +28,9 @@ on:
   workflow_dispatch:
     inputs:
       cluster_name:
-        description: 'Target cluster'
+        description: 'Target cluster (e.g. example-node-1, example-management)'
         required: true
-        type: choice
-        options:
-          - ai-pod-1
-          - ai-pod-2
-          - ai-pod-3
-          - ai-pod-4
+        type: string
       cni_type:
         description: 'CNI type to deploy (Cilium required for SAIF platform)'
         required: true
@@ -67,6 +62,11 @@ on:
         type: boolean
         default: false
 
+      post_install_contract:
+        description: 'JSON runner paths: cluster_dir, artifact_manifest, raw_target_root, gitops_target_root; required when post_install=true'
+        required: false
+        type: string
+        default: '{}'
       request_id:
         description: 'Orchestrator correlation ID (for run tracking)'
         required: false
@@ -76,19 +76,48 @@ on:
 permissions:
   contents: write
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
+  preflight:
+    name: Validate private post-install handoff before deployment
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    container:
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+    steps:
+      - name: Check selected handoff paths
+        env:
+          POST_INSTALL: ${{ inputs.post_install }}
+          POST_INSTALL_CONTRACT: ${{ inputs.post_install_contract }}
+        run: |
+          python3 - <<'PYTHON'
+          import json,os
+          from pathlib import Path
+          if os.environ['POST_INSTALL'] != 'true':
+              raise SystemExit(0)
+          contract=json.loads(os.environ['POST_INSTALL_CONTRACT'])
+          for key in ('cluster_dir','artifact_manifest','raw_target_root','gitops_target_root'):
+              value=contract.get(key)
+              if not isinstance(value,str) or not Path(value).is_absolute() or not (Path(value).is_file() if key=='artifact_manifest' else Path(value).is_dir()):
+                  raise SystemExit('post_install requires a mounted absolute '+key+' before deployment')
+          PYTHON
+
   validate:
     name: 'Validate'
+    needs: preflight
     if: inputs.validate == true
     uses: ./.github/workflows/openshift-validate.yaml
     with:
       cluster_name: ${{ inputs.cluster_name }}
+      cni_type: ${{ inputs.cni_type }}
     secrets: inherit
 
   deploy:
     name: 'Deploy'
-    needs: validate
-    if: always() && inputs.deploy == true && (needs.validate.result == 'success' || needs.validate.result == 'skipped')
+    needs: [preflight, validate]
+    if: always() && needs.preflight.result == 'success' && inputs.deploy == true && (needs.validate.result == 'success' || needs.validate.result == 'skipped')
     uses: ./.github/workflows/openshift-deploy.yaml
     with:
       cluster_name: ${{ inputs.cluster_name }}
@@ -99,19 +128,23 @@ jobs:
 
   post_install:
     name: 'Post-Install'
-    needs: [validate, deploy]
-    if: always() && inputs.post_install == true && (needs.deploy.result == 'success' || needs.deploy.result == 'skipped')
+    needs: [preflight, validate, deploy]
+    if: always() && needs.preflight.result == 'success' && inputs.post_install == true && (needs.validate.result == 'success' || needs.validate.result == 'skipped') && (needs.deploy.result == 'success' || needs.deploy.result == 'skipped')
     uses: ./.github/workflows/openshift-post-install.yaml
     with:
       cluster_name: ${{ inputs.cluster_name }}
+      cluster_dir: ${{ fromJSON(inputs.post_install_contract).cluster_dir || '' }}
+      artifact_manifest: ${{ fromJSON(inputs.post_install_contract).artifact_manifest || '' }}
+      raw_target_root: ${{ fromJSON(inputs.post_install_contract).raw_target_root || '' }}
+      gitops_target_root: ${{ fromJSON(inputs.post_install_contract).gitops_target_root || '' }}
       apply_idms: true
       apply_argocd: true
     secrets: inherit
 
   test:
     name: 'Test'
-    needs: [validate, deploy, post_install]
-    if: always() && inputs.test == true && (needs.post_install.result == 'success' || needs.post_install.result == 'skipped')
+    needs: [preflight, validate, deploy, post_install]
+    if: always() && needs.preflight.result == 'success' && inputs.test == true && (needs.validate.result == 'success' || needs.validate.result == 'skipped') && (needs.deploy.result == 'success' || needs.deploy.result == 'skipped') && (needs.post_install.result == 'success' || needs.post_install.result == 'skipped')
     uses: ./.github/workflows/openshift-test.yaml
     with:
       cluster_name: ${{ inputs.cluster_name }}
@@ -121,7 +154,7 @@ jobs:
     name: 'Pipeline Summary'
     needs: [validate, deploy, post_install, test]
     if: always()
-    runs-on: [self-hosted, linux, saif-github-runner]
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     steps:
     - name: Generate Summary
       run: |

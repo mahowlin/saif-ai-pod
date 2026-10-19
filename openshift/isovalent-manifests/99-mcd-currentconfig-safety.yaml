@@ -22,10 +22,12 @@
 #          MCD pod then enters bootstrap mode, hits strict validation that fails
 #          on IDMS-generated file diffs, and marks MCO Degraded permanently.
 #
-# Solution: After firstboot completes, if currentconfig doesn't exist, copy it
-#           from the bootstrap MCS content file. This ensures MCD never enters
-#           bootstrap mode and handles config diffs through the normal update path
-#           (apply + reboot) instead of the strict bootstrap validation path.
+# Solution: After firstboot completes, if currentconfig doesn't exist, create it
+#           from the bootstrap MCS content file with a MODIFIED MC name. The name
+#           change is critical: if currentconfig's MC name matches the bootstrap MC
+#           name, MCD enters strict bootstrap validation and rejects any diff
+#           (whitespace, IDMS files). By renaming, MCD enters NORMAL update mode
+#           and handles diffs through the standard apply+reboot path.
 #
 # Timing: Runs after machine-config-daemon-firstboot, before kubelet starts.
 #         Takes <1 second. Only runs when the file is missing (ConditionPathExists).
@@ -54,8 +56,8 @@ spec:
 
             [Service]
             Type=oneshot
-            ExecStart=/bin/cp /etc/mcs-machine-config-content.json /etc/machine-config-daemon/currentconfig
-            ExecStartPost=/bin/echo "MCD Safety: Created currentconfig from bootstrap MCS content"
+            ExecStart=/bin/bash -c 'sed "0,/rendered-master-/s/rendered-master-/mcd-safety-net-/" /etc/mcs-machine-config-content.json > /etc/machine-config-daemon/currentconfig'
+            ExecStartPost=/bin/echo "MCD Safety: Created currentconfig with modified MC name (bypass bootstrap validation)"
             RemainAfterExit=yes
 
             [Install]

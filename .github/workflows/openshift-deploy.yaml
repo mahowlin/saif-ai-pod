@@ -19,14 +19,9 @@ on:
   workflow_dispatch:
     inputs:
       cluster_name:
-        description: 'Target cluster'
+        description: 'Target cluster (e.g. example-node-1, example-management)'
         required: true
-        type: choice
-        options:
-          - ai-pod-1
-          - ai-pod-2
-          - ai-pod-3
-          - ai-pod-4
+        type: string
       action:
         description: 'Action to perform'
         required: true
@@ -34,7 +29,6 @@ on:
         options:
           - DRY-RUN
           - DEPLOY
-          - DESTROY
         default: 'DRY-RUN'
       cni_type:
         description: 'CNI type to deploy (Cilium required for SAIF platform)'
@@ -68,14 +62,14 @@ on:
 
 defaults:
   run:
-    working-directory: openshift
+    shell: bash
 
 jobs:
   deploy:
-    name: 'Generate Agent-Based Installer ISO'
-    runs-on: [self-hosted, linux, saif-github-runner]
+    name: 'Deploy OpenShift Cluster'
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     container:
-      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
     if: inputs.action == 'DEPLOY'
 
     env:
@@ -84,170 +78,213 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Validate installation adapter scope
+      env:
+        REQUESTED_ACTION: ${{ inputs.action }}
+      run: |
+        case "$REQUESTED_ACTION" in DEPLOY|DRY-RUN) ;; *) echo 'Use openshift-undeploy.yaml for the confirmed undeploy operation.' >&2; exit 1 ;; esac
+        MODE=$(yq -er '.imageDelivery.mode' "data/openshift/$CLUSTER/metadata.yaml")
+        if [ "$MODE" != mirrored ]; then
+          echo 'This UCS installation adapter supports mirrored delivery. Use agents/installation.md for the connected Agent Installer procedure.' >&2
+          exit 1
+        fi
+
+    - name: Pull Resolved Hardware Config
+      run: |
+        git pull --ff-only origin "${GITHUB_REF_NAME}"
 
     - name: Check if Cluster Already Operational
       if: inputs.force_deploy != true
       env:
         SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        SSH_PROXY_JUMP: ${{ vars.SSH_PROXY_JUMP }}
+      shell: bash
       run: |
-        echo "## Deployment Safeguard Check" >> $GITHUB_STEP_SUMMARY
+        set -euo pipefail
+        AGENT_CONFIG="data/openshift/$CLUSTER/agent-config.yaml"
+        test -f "$AGENT_CONFIG"
+        export CLUSTER_IP
+        CLUSTER_IP=$(yq -er '.rendezvousIP | select(. != null and . != "")' "$AGENT_CONFIG")
+        bash scripts/check-cluster-before-install.sh
 
-        CLUSTER_IP=$(yq -r ".clusters[] | select(.name == \"$CLUSTER\") | .ip" cluster-mappings.yaml)
+    - name: Enrich Cilium Day 1 Manifests
+      run: |
+        echo "## Cilium Day 1 Manifest Enrichment" >> $GITHUB_STEP_SUMMARY
+        python3 scripts/enrich-cilium-day1-manifests.py \
+          --cluster-dir "data/openshift/$CLUSTER" | tee /tmp/cilium-day1-enrichment.log
+        sed 's/^/  /' /tmp/cilium-day1-enrichment.log >> $GITHUB_STEP_SUMMARY
 
-        if [ -z "$CLUSTER_IP" ] || [ "$CLUSTER_IP" = "null" ]; then
-          echo "::error::Cannot find IP for cluster $CLUSTER in cluster-mappings.yaml"
+    - name: Validate Selected Cluster Contract
+      run: |
+        echo "## Selected Cluster Contract" >> $GITHUB_STEP_SUMMARY
+        scripts/validate-selected-cluster-contract.py \
+          --cluster-dir "data/openshift/$CLUSTER" \
+          --action deploy
+        echo "✅ Selected cluster folder is valid for deploy" >> $GITHUB_STEP_SUMMARY
+
+    - name: Validate Toolchain Provenance
+      env:
+        RUNNER_CONTAINER_IMAGE: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+      run: |
+        scripts/validate-toolchain-provenance.sh "$CLUSTER" x86_64
+
+    - name: Validate Resolved Hardware Config
+      env:
+        INTERSIGHT_API_KEY_ID: ${{ secrets.INTERSIGHT_API_KEY_ID }}
+        INTERSIGHT_SECRET_KEY: ${{ secrets.INTERSIGHT_SECRET_KEY }}
+      run: |
+        echo "## Resolved Hardware Config" >> $GITHUB_STEP_SUMMARY
+        DATA_DIR="data/openshift/$CLUSTER"
+        AGENT_CONFIG="$DATA_DIR/agent-config.yaml"
+
+        if grep -q 'MAC_PLACEHOLDER\|BOOT_DISK_MODEL_PLACEHOLDER' "$AGENT_CONFIG"; then
+          echo "❌ Hardware placeholders remain in committed AgentConfig; validation must resolve and commit hardware facts before deploy" >> $GITHUB_STEP_SUMMARY
+          grep -n 'PLACEHOLDER' "$AGENT_CONFIG" >> $GITHUB_STEP_SUMMARY
           exit 1
         fi
 
-        echo "Checking if cluster $CLUSTER ($CLUSTER_IP) is already operational..."
+        python3 scripts/resolve-agent-hardware.py --cluster "$CLUSTER" --write > /tmp/deploy-hardware-check.log
+        sed 's/^/  /' /tmp/deploy-hardware-check.log >> $GITHUB_STEP_SUMMARY
 
-        # Set up SSH key
-        echo "$SSH_PRIVATE_KEY" > /tmp/ssh_key
-        chmod 600 /tmp/ssh_key
-
-        # Try SSH to cluster and check if oc responds via recovery kubeconfig
-        RECOVERY_KUBECONFIG="/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/localhost-recovery.kubeconfig"
-
-        if ssh -i /tmp/ssh_key -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-           -J ubuntu@10.0.0.10 core@$CLUSTER_IP \
-           "sudo oc get nodes --kubeconfig=$RECOVERY_KUBECONFIG" &>/dev/null; then
-
-          rm -f /tmp/ssh_key
-
-          echo "::error::Cluster $CLUSTER is OPERATIONAL!"
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### ❌ Deployment Blocked" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Cluster $CLUSTER is already operational.**" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Re-running deploy will **DESTROY** the existing cluster." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Options:**" >> $GITHUB_STEP_SUMMARY
-          echo "- Use **Post-Install** stage for kubeconfig/IDMS/ArgoCD updates" >> $GITHUB_STEP_SUMMARY
-          echo "- Run pipeline with \`deploy=false\` and \`post_install=true\`" >> $GITHUB_STEP_SUMMARY
-          echo "- If you really need to redeploy, first undeploy the cluster" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+        if ! git diff --quiet -- "$AGENT_CONFIG"; then
+          echo "❌ Committed AgentConfig does not match live UCS hardware data" >> $GITHUB_STEP_SUMMARY
+          git diff -- "$AGENT_CONFIG" >> $GITHUB_STEP_SUMMARY
           exit 1
         fi
 
-        rm -f /tmp/ssh_key
-
-        echo "✅ Cluster not operational, proceeding with deployment..." >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-
-    - name: Verify OpenShift Tools
-      run: |
-        openshift-install version
-        oc version --client
-
-    - name: Render OpenShift Configs
-      working-directory: .
-      run: |
-        echo "## Rendering Cluster Configuration" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "Generating install-config.yaml and agent-config.yaml from templates..." >> $GITHUB_STEP_SUMMARY
-
-        # Render configs (script reads from ucs-state.yaml at repo root)
-        # Note: jinja2 and pyyaml should already be installed in the container
-        python3 scripts/render-cluster-config.py $CLUSTER
-
-        # Show what was rendered
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "### Rendered Configuration" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-
-        # Extract key details from rendered configs
-        MAC=$(grep "macAddress:" openshift/data/$CLUSTER/agent-config.yaml | head -1 | awk '{print $2}')
-        CLUSTER_IP=$(grep "rendezvousIP:" openshift/data/$CLUSTER/agent-config.yaml | awk '{print $2}')
-
-        echo "- **Cluster**: $CLUSTER" >> $GITHUB_STEP_SUMMARY
-        echo "- **MAC Address**: $MAC" >> $GITHUB_STEP_SUMMARY
-        echo "- **Rendezvous IP**: $CLUSTER_IP" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-
-    - name: Commit Rendered Configs
-      working-directory: .
-      run: |
-        # Configure git
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-
-        # Check if there are changes
-        if git diff --quiet openshift/data/$CLUSTER/; then
-          echo "No changes to rendered configs"
-        else
-          echo "Committing rendered configs for $CLUSTER..."
-
-          git add openshift/data/$CLUSTER/install-config.yaml
-          git add openshift/data/$CLUSTER/agent-config.yaml
-          git add openshift/data/$CLUSTER/manifests/
-
-          git commit -m "Render OpenShift configs for $CLUSTER"
-
-          for attempt in 1 2 3; do
-            git rebase --abort 2>/dev/null || true
-            if git pull --rebase origin main && git push; then break; fi
-            if [ $attempt -eq 3 ]; then echo "::error::Push failed after 3 attempts"; exit 1; fi
-            echo "Push race (attempt $attempt/3), retrying..."
-            sleep $((attempt * 2))
-          done
-
-          echo "✅ Rendered configs committed to repository" >> $GITHUB_STEP_SUMMARY
-        fi
+        echo "✅ Committed AgentConfig matches live UCS hardware data" >> $GITHUB_STEP_SUMMARY
 
     - name: Prepare Working Directory
-      working-directory: .
       run: |
-        WORKDIR="$(pwd)/workdir-$(date +%Y%m%d-%H%M%S)"
-        mkdir -p $WORKDIR
+        umask 077
+        WORKDIR=$(mktemp -d "$RUNNER_TEMP/openshift-install.XXXXXX")
         echo "WORKDIR=$WORKDIR" >> $GITHUB_ENV
         echo "Working directory: $WORKDIR"
 
-    - name: Generate install-config.yaml and agent-config.yaml
-      working-directory: .
+    - name: Inject Secrets into Deployment Configs
       run: |
-        # Debug: Check if secrets have content (don't print actual content)
-        echo "Checking secrets..."
-        if [ -n "$REDHAT_PULL_SECRET" ]; then
-          echo "✅ REDHAT_PULL_SECRET has content (${#REDHAT_PULL_SECRET} chars)"
-        else
-          echo "❌ REDHAT_PULL_SECRET is EMPTY"
-        fi
-        if [ -n "$SSH_PUBLIC_KEY" ]; then
-          echo "✅ SSH_PUBLIC_KEY has content (${#SSH_PUBLIC_KEY} chars)"
-        else
-          echo "❌ SSH_PUBLIC_KEY is EMPTY"
-        fi
-        if [ -n "$REGISTRY_CA_CERT" ]; then
-          echo "✅ REGISTRY_CA_CERT has content (${#REGISTRY_CA_CERT} chars)"
-        else
-          echo "❌ REGISTRY_CA_CERT is EMPTY"
-        fi
+        DATA_DIR="data/openshift/$CLUSTER"
+
+        # Verify secrets are available
+        for SECRET_NAME in REDHAT_PULL_SECRET SSH_PUBLIC_KEY REGISTRY_CA_CERT; do
+          eval "SECRET_VAL=\$$SECRET_NAME"
+          if [ -n "$SECRET_VAL" ]; then
+            echo "✅ $SECRET_NAME has content (${#SECRET_VAL} chars)"
+          else
+            echo "❌ $SECRET_NAME is EMPTY"
+            exit 1
+          fi
+        done
 
         # CRITICAL: Strip quay.io/registry.redhat.io credentials from pull secret
         # Root cause: oc image extract bypasses ICSP mirrors when it finds quay.io credentials
         # This causes ISO generation to take 31+ minutes instead of <1 minute
         # With IDMS mirrorSourcePolicy: NeverContactSource, cluster uses local registry only
-        # See: plans/ISO_GENERATION_OPTIMIZATION.md for test results
         echo "Stripping upstream registry credentials from pull secret for ISO generation..."
         STRIPPED_PULL_SECRET=$(echo "$REDHAT_PULL_SECRET" | python3 -c 'import sys,json; ps=json.load(sys.stdin); [ps.get("auths",{}).pop(r,None) for r in ["quay.io","registry.redhat.io","registry.connect.redhat.com","cloud.openshift.com"]]; print(json.dumps(ps))')
-        export REDHAT_PULL_SECRET="$STRIPPED_PULL_SECRET"
         echo "✅ Stripped upstream registry credentials ($(echo "$STRIPPED_PULL_SECRET" | python3 -c 'import sys,json; print(len(json.load(sys.stdin).get("auths",{})))') registries remaining)"
 
-        # Render configs directly to workdir with secrets injected
-        # This creates install-config.yaml and agent-config.yaml with real secrets
-        echo "Rendering configs with secrets for deployment..."
+        # Copy enriched SAIF artifacts to workdir
+        cp "$DATA_DIR/install-config.yaml" "$WORKDIR/install-config.yaml"
+        cp "$DATA_DIR/agent-config.yaml" "$WORKDIR/agent-config.yaml"
 
-        # Build render command with optional --cilium flag
-        RENDER_CMD="python3 scripts/render-cluster-config.py $CLUSTER --output-dir $WORKDIR --inject-secrets"
+        # Inject secrets into install-config.yaml (replace placeholders)
+        # Use python to handle multi-line values (CA cert) safely
+        python3 - "$WORKDIR/install-config.yaml" "$STRIPPED_PULL_SECRET" <<'PYEOF'
+        import sys
+        path, secret = sys.argv[1], sys.argv[2]
+        with open(path, 'r') as f:
+            content = f.read()
+        content = content.replace("'''PULL_SECRET_PLACEHOLDER'''", "'" + secret + "'")
+        with open(path, 'w') as f:
+            f.write(content)
+        PYEOF
+
+        sed -i "s|SSH_KEY_PLACEHOLDER|$SSH_PUBLIC_KEY|g" "$WORKDIR/install-config.yaml"
+
+        # Replace CA cert placeholder with actual cert (multi-line)
+        python3 - "$WORKDIR/install-config.yaml" <<'PYEOF'
+        import os, sys
+        path = sys.argv[1]
+        with open(path, 'r') as f:
+            content = f.read()
+        ca_cert = os.environ['REGISTRY_CA_CERT']
+        indented_cert = '\n'.join('  ' + line for line in ca_cert.strip().splitlines())
+        content = content.replace('  REGISTRY_CA_PLACEHOLDER', indented_cert)
+        with open(path, 'w') as f:
+            f.write(content)
+        PYEOF
+
+        # Validate workflow CNI intent against rendered install-config.
+        RENDERED_NETWORK_TYPE=$(yq -r '.networking.networkType' "$WORKDIR/install-config.yaml")
+        case "${{ inputs.cni_type }}" in
+          Cilium)
+            EXPECTED_NETWORK_TYPE="Cilium"
+            ;;
+          OVN)
+            EXPECTED_NETWORK_TYPE="OVNKubernetes"
+            ;;
+          *)
+            echo "❌ Unsupported cni_type input: ${{ inputs.cni_type }}"
+            exit 1
+            ;;
+        esac
+
+        if [ "$RENDERED_NETWORK_TYPE" != "$EXPECTED_NETWORK_TYPE" ]; then
+          echo "❌ CNI input/rendered config mismatch: input ${{ inputs.cni_type }} expects $EXPECTED_NETWORK_TYPE, install-config has $RENDERED_NETWORK_TYPE"
+          exit 1
+        fi
+        echo "✅ CNI input matches rendered install-config networkType: $RENDERED_NETWORK_TYPE"
+
+        # Copy Day 1 manifests if CNI is Cilium.
+        # For Agent-Based Installer, CLife manifests must be embedded under ./openshift/
+        # before `openshift-install agent create image`.
         if [ "${{ inputs.cni_type }}" = "Cilium" ]; then
-          echo "🔧 Cilium CNI selected - including Cilium Day 1 manifests"
-          RENDER_CMD="$RENDER_CMD --cilium"
+          echo "Cilium CNI selected — including Day 1 manifests"
+          mkdir -p "$WORKDIR/openshift"
+
+          if [ -d "$DATA_DIR/manifests" ] && [ "$(ls -A $DATA_DIR/manifests 2>/dev/null)" ]; then
+            cp -r "$DATA_DIR/manifests/"* "$WORKDIR/openshift/" 2>/dev/null || true
+            echo "✅ Copied Cilium Day 1 manifests from $DATA_DIR/manifests"
+          else
+            echo "❌ Cilium networkType requires Day 1 CLife manifests in $DATA_DIR/manifests"
+            echo "   The IEP OpenShift install method requires copying prepared CLife manifests into ./openshift/ for Agent-Based Installer."
+            echo "   Re-render the cluster bundle so data/openshift/$CLUSTER/manifests contains ciliumconfig, CLife deployment/RBAC, and related manifests."
+            exit 1
+          fi
         fi
 
-        eval $RENDER_CMD
+        # Verify no placeholders remain in runtime configs.
+        if grep -q 'PULL_SECRET_PLACEHOLDER\|SSH_KEY_PLACEHOLDER\|REGISTRY_CA_PLACEHOLDER' "$WORKDIR/install-config.yaml"; then
+          echo "❌ Secret placeholders still remain in install-config.yaml"
+          grep -n 'PLACEHOLDER' "$WORKDIR/install-config.yaml"
+          exit 1
+        fi
 
-        echo "✅ Configs rendered to $WORKDIR with secrets injected"
+        if grep -q 'MAC_PLACEHOLDER\|BOOT_DISK_MODEL_PLACEHOLDER' "$WORKDIR/agent-config.yaml"; then
+          echo "❌ Hardware placeholders still remain in agent-config.yaml"
+          grep -n 'PLACEHOLDER' "$WORKDIR/agent-config.yaml"
+          exit 1
+        fi
+
+        EXPECTED_NODES=$(yq -r '.nodes | length' "$DATA_DIR/metadata.yaml")
+        AGENT_HOSTS=$(yq -r '.hosts | length' "$WORKDIR/agent-config.yaml")
+        if [ "$AGENT_HOSTS" != "$EXPECTED_NODES" ]; then
+          echo "❌ AgentConfig host count mismatch: metadata has $EXPECTED_NODES nodes, agent-config has $AGENT_HOSTS hosts"
+          exit 1
+        fi
+
+        NTP_COUNT=$(yq -r '.additionalNTPSources // [] | length' "$WORKDIR/agent-config.yaml")
+        if [ "$NTP_COUNT" -lt 1 ]; then
+          echo "❌ AgentConfig additionalNTPSources is required for live ISO time sync"
+          exit 1
+        fi
+        echo "✅ AgentConfig has $AGENT_HOSTS hosts and $NTP_COUNT NTP source(s)"
+
+        echo "✅ Secrets and runtime config validations passed for $WORKDIR"
       env:
         REDHAT_PULL_SECRET: ${{ secrets.REDHAT_PULL_SECRET }}
         SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
@@ -278,7 +315,6 @@ jobs:
         fi
 
     - name: Add Registry CA to Container Trust Store
-      working-directory: .
       env:
         REGISTRY_CA_CERT: ${{ secrets.REGISTRY_CA_CERT }}
       run: |
@@ -289,8 +325,9 @@ jobs:
         echo "✅ Registry CA certificate added to container trust store"
 
         # Verify we can now access registry without -k flag
-        REGISTRY_HOST=$(yq -r ".infrastructure.registry.hostname" openshift/cluster-mappings.yaml)
-        REGISTRY_PORT=$(yq -r ".infrastructure.registry.port" openshift/cluster-mappings.yaml)
+        REGISTRY_MIRROR=$(yq -r '.imageDigestSources[0].mirrors[0]' "data/openshift/$CLUSTER/install-config.yaml")
+        REGISTRY_HOST=$(echo "$REGISTRY_MIRROR" | cut -d: -f1)
+        REGISTRY_PORT=$(echo "$REGISTRY_MIRROR" | cut -d: -f2 | cut -d/ -f1)
         if curl -sf "https://${REGISTRY_HOST}:${REGISTRY_PORT}/v2/" > /dev/null; then
           echo "✅ Registry TLS verification working"
         else
@@ -298,58 +335,46 @@ jobs:
           exit 1
         fi
 
-    - name: Download IDMS Manifests
-      working-directory: .
-      env:
-        GH_TOKEN: ${{ secrets.KUBECONFIG_REPO_TOKEN }}
+    - name: Stage Deploy Image Policy Bundles
       run: |
         echo "## IDMS Bootstrap Configuration" >> $GITHUB_STEP_SUMMARY
+        DATA_DIR="data/openshift/$CLUSTER"
+        mkdir -p "$WORKDIR/manifests"
 
-        # Find latest successful sync-images run in saif-sys-admin
-        LATEST_RUN=$(gh run list \
-          --repo mahowlin/saif-sys-admin \
-          --workflow sync-images.yaml \
-          --status success \
-          --limit 1 \
-          --json databaseId \
-          --jq '.[0].databaseId')
+        resolve_bundle_dir() {
+          local scope="$1"
+          local key="$2"
+          local ref
+          ref=$(yq -r ".imagePolicyBundles.${key} // \"\"" "$DATA_DIR/metadata.yaml")
+          if [ -z "$ref" ] || [ "$ref" = "null" ]; then
+            echo "❌ Missing metadata imagePolicyBundles.${key} for $scope" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          if [ "$ref" = "$scope" ]; then
+            echo "$DATA_DIR/image-policy-bundles/$scope"
+          elif [[ "$ref" = /* ]]; then
+            echo "$ref"
+          else
+            echo "$DATA_DIR/$ref"
+          fi
+        }
 
-        if [ -z "$LATEST_RUN" ] || [ "$LATEST_RUN" = "null" ]; then
-          echo "⚠️ No sync-images runs found - cluster will deploy without IDMS" >> $GITHUB_STEP_SUMMARY
-          echo "   Run sync-images workflow in saif-sys-admin first for full functionality" >> $GITHUB_STEP_SUMMARY
-          exit 0
-        fi
+        for ENTRY in "ocp-install-core:ocpInstallCore" "cilium-day1:ciliumDay1"; do
+          SCOPE="${ENTRY%%:*}"
+          KEY="${ENTRY##*:}"
+          BUNDLE_DIR=$(resolve_bundle_dir "$SCOPE" "$KEY")
+          if [ ! -f "$BUNDLE_DIR/bundle.yaml" ] || [ ! -d "$BUNDLE_DIR/manifests" ]; then
+            echo "❌ Missing selected $SCOPE image-policy bundle under $BUNDLE_DIR" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          cp "$BUNDLE_DIR/manifests"/*.yaml "$WORKDIR/manifests/"
+          echo "✅ Staged $SCOPE bundle from $BUNDLE_DIR" >> $GITHUB_STEP_SUMMARY
+        done
 
-        echo "Found sync-images run: $LATEST_RUN" >> $GITHUB_STEP_SUMMARY
-
-        # Download IDMS artifacts to temp location
-        IDMS_TEMP="/tmp/idms-download"
-        mkdir -p "$IDMS_TEMP"
-
-        if gh run download "$LATEST_RUN" \
-          --repo mahowlin/saif-sys-admin \
-          --name idms-manifests \
-          --dir "$IDMS_TEMP"; then
-
-          # Copy only IDMS and ITMS files (avoid CatalogSource conflicts)
-          mkdir -p "$WORKDIR/manifests"
-          cp "$IDMS_TEMP"/idms-*.yaml "$WORKDIR/manifests/" 2>/dev/null || true
-          cp "$IDMS_TEMP"/itms-*.yaml "$WORKDIR/manifests/" 2>/dev/null || true
-
-          # Strip whitespace to avoid shell comparison issues
-          IDMS_COUNT=$(ls "$WORKDIR/manifests"/idms-*.yaml 2>/dev/null | wc -l | tr -d '[:space:]')
-          IDMS_COUNT="${IDMS_COUNT:-0}"
-          ITMS_COUNT=$(ls "$WORKDIR/manifests"/itms-*.yaml 2>/dev/null | wc -l | tr -d '[:space:]')
-          ITMS_COUNT="${ITMS_COUNT:-0}"
-
-          TOTAL_MANIFESTS=$(ls "$WORKDIR/manifests"/*.yaml 2>/dev/null | wc -l | tr -d '[:space:]')
-          echo "✅ Downloaded $IDMS_COUNT IDMS and $ITMS_COUNT ITMS manifests for ISO ($TOTAL_MANIFESTS files total)" >> $GITHUB_STEP_SUMMARY
-
-          rm -rf "$IDMS_TEMP"
-        else
-          echo "⚠️ Failed to download IDMS artifacts from run $LATEST_RUN" >> $GITHUB_STEP_SUMMARY
-          echo "   Cluster will deploy without IDMS - apply manually post-install" >> $GITHUB_STEP_SUMMARY
-        fi
+        IDMS_COUNT=$(ls "$WORKDIR/manifests"/*ImageDigestMirrorSet*.yaml "$WORKDIR/manifests"/idms-*.yaml "$WORKDIR/manifests"/*idms*.yaml 2>/dev/null | wc -l | tr -d '[:space:]')
+        ITMS_COUNT=$(ls "$WORKDIR/manifests"/*ImageTagMirrorSet*.yaml "$WORKDIR/manifests"/itms-*.yaml "$WORKDIR/manifests"/*itms*.yaml 2>/dev/null | wc -l | tr -d '[:space:]')
+        TOTAL_MANIFESTS=$(ls "$WORKDIR/manifests"/*.yaml 2>/dev/null | wc -l | tr -d '[:space:]')
+        echo "✅ Staged $TOTAL_MANIFESTS selected image-policy manifests for ISO ($IDMS_COUNT IDMS-like, $ITMS_COUNT ITMS-like)" >> $GITHUB_STEP_SUMMARY
 
     - name: Pre-populate ISO Cache
       env:
@@ -364,13 +389,13 @@ jobs:
         mkdir -p "$CACHE_DIR/files_cache"
 
         # Webserver URL (same server that hosts generated ISOs)
-        CACHE_BASE_URL="${{ vars.OCP_ISO_SERVER_URL }}/ocp-cache"
+        CACHE_ROOT_URL="${{ vars.OCP_ISO_SERVER_URL }}/ocp-cache"
 
         # Expected minimum sizes for validation
         MIN_ISO_SIZE=1000000000   # 1GB - CoreOS ISO should be ~1.3GB
 
         # Download CoreOS base ISO (1.3GB)
-        ISO_URL="$CACHE_BASE_URL/coreos-x86_64.iso"
+        ISO_URL="$CACHE_ROOT_URL/coreos-x86_64.iso"
         ISO_PATH="$CACHE_DIR/image_cache/coreos-x86_64.iso"
 
         echo "Fetching CoreOS base ISO from cache server..."
@@ -391,20 +416,20 @@ jobs:
         fi
 
     - name: Extract CoreOS Stream Metadata from Registry
-      working-directory: .
       run: |
         echo "## CoreOS Stream Metadata" >> $GITHUB_STEP_SUMMARY
 
-        # Get registry info from cluster-mappings
-        REGISTRY_HOST=$(yq -r ".infrastructure.registry.hostname" openshift/cluster-mappings.yaml)
-        REGISTRY_PORT=$(yq -r ".infrastructure.registry.port" openshift/cluster-mappings.yaml)
+        # Get registry info and OCP version from SAIF-generated artifacts
+        REGISTRY_MIRROR=$(yq -r '.imageDigestSources[0].mirrors[0]' "data/openshift/$CLUSTER/install-config.yaml")
+        REGISTRY_HOST=$(echo "$REGISTRY_MIRROR" | cut -d: -f1)
+        REGISTRY_PORT=$(echo "$REGISTRY_MIRROR" | cut -d: -f2 | cut -d/ -f1)
         REGISTRY="${REGISTRY_HOST}:${REGISTRY_PORT}"
-        OCP_VERSION=$(yq -r ".clusters[] | select(.name == \"$CLUSTER\") | .openshift_version" openshift/cluster-mappings.yaml)
+        OCP_VERSION=$(yq -r '.ocpVersion' "data/openshift/$CLUSTER/metadata.yaml")
 
         # Get exact release tag from registry
         TAGS_RESPONSE=$(curl -sf "https://${REGISTRY}/v2/openshift/release-images/tags/list")
         RELEASE_TAG=$(echo "$TAGS_RESPONSE" | \
-          jq -r ".tags[] | select(startswith(\"${OCP_VERSION}.\") and endswith(\"-x86_64\"))" | \
+          jq -r ".tags[] | select(. == \"${OCP_VERSION}-x86_64\")" | \
           sort -V | tail -1)
 
         if [ -z "$RELEASE_TAG" ]; then
@@ -491,12 +516,11 @@ jobs:
         rm -f /tmp/combined-idms.yaml
 
     - name: Generate Agent ISO
-      working-directory: .
       run: |
         cd $WORKDIR
 
         # Copy Day 1 manifests to be embedded in ISO
-        # Manifests are rendered by render-cluster-config.py to ./manifests/
+        # Manifests are in the workdir's openshift/ subdirectory (copied during secret injection)
         # openshift-install expects them in ./openshift/
         mkdir -p openshift
 
@@ -507,16 +531,11 @@ jobs:
           ls -la openshift/
         fi
 
-        # Copy any static manifests from repo (legacy support)
-        if [ -d "../openshift/manifests" ] && [ "$(ls -A ../openshift/manifests 2>/dev/null)" ]; then
-          cp -r ../openshift/manifests/* openshift/ 2>/dev/null || true
-          echo "Copied static manifests from repo"
-        fi
-
-        # Get OpenShift version from cluster-mappings
-        OCP_VERSION=$(yq -r ".clusters[] | select(.name == \"$CLUSTER\") | .openshift_version" ../openshift/cluster-mappings.yaml)
-        REGISTRY_HOST=$(yq -r ".infrastructure.registry.hostname" ../openshift/cluster-mappings.yaml)
-        REGISTRY_PORT=$(yq -r ".infrastructure.registry.port" ../openshift/cluster-mappings.yaml)
+        # Get OpenShift version and registry from SAIF-generated artifacts
+        OCP_VERSION=$(yq -r '.ocpVersion' "$GITHUB_WORKSPACE/data/openshift/$CLUSTER/metadata.yaml")
+        REGISTRY_MIRROR=$(yq -r '.imageDigestSources[0].mirrors[0]' "$GITHUB_WORKSPACE/data/openshift/$CLUSTER/install-config.yaml")
+        REGISTRY_HOST=$(echo "$REGISTRY_MIRROR" | cut -d: -f1)
+        REGISTRY_PORT=$(echo "$REGISTRY_MIRROR" | cut -d: -f2 | cut -d/ -f1)
         REGISTRY="${REGISTRY_HOST}:${REGISTRY_PORT}"
 
         # Query registry for the exact release tag matching our version
@@ -525,7 +544,7 @@ jobs:
         TAGS_RESPONSE=$(curl -sf "https://${REGISTRY}/v2/openshift/release-images/tags/list")
 
         RELEASE_TAG=$(echo "$TAGS_RESPONSE" | \
-          jq -r ".tags[] | select(startswith(\"${OCP_VERSION}.\") and endswith(\"-x86_64\"))" | \
+          jq -r ".tags[] | select(. == \"${OCP_VERSION}-x86_64\")" | \
           sort -V | tail -1)
 
         if [ -z "$RELEASE_TAG" ]; then
@@ -545,21 +564,75 @@ jobs:
           echo "❌ Failed to get digest for release image"
           exit 1
         fi
+        RELEASE_LABEL=$(oc image info "${REGISTRY}/openshift/release-images:${RELEASE_TAG}" --insecure=true -o json | jq -r '.config.config.Labels["io.openshift.release"] // empty')
+        if [ "$RELEASE_LABEL" != "$OCP_VERSION" ]; then
+          echo "❌ Release payload label mismatch: expected ${OCP_VERSION}, got ${RELEASE_LABEL:-empty}"
+          exit 1
+        fi
         echo "Release image digest: ${RELEASE_DIGEST}"
 
+        RELEASE_IMAGE_BY_DIGEST="${REGISTRY}/openshift/release-images@${RELEASE_DIGEST}"
+        jq -n \
+          --arg cluster "$CLUSTER" \
+          --arg ocpVersion "$OCP_VERSION" \
+          --arg registry "$REGISTRY" \
+          --arg releaseTag "$RELEASE_TAG" \
+          --arg releaseDigest "$RELEASE_DIGEST" \
+          --arg releaseImage "$RELEASE_IMAGE_BY_DIGEST" \
+          '{cluster: $cluster, ocpVersion: $ocpVersion, registry: $registry, releaseTag: $releaseTag, releaseDigest: $releaseDigest, releaseImage: $releaseImage}' \
+          > "$WORKDIR/release-selection.json"
+
+        # Build local-only IDMS rules for extracting tools from the selected release payload.
+        # This keeps the workflow disconnected: component references from the release payload
+        # are rewritten to registry.example.com instead of contacting quay.io.
+        cat > /tmp/combined-idms.yaml << 'IDMS_EOF'
+        apiVersion: config.openshift.io/v1
+        kind: ImageDigestMirrorSet
+        metadata:
+          name: local-mirror
+        spec:
+          imageDigestMirrors:
+          - mirrors:
+            - REGISTRY_PLACEHOLDER/openshift/release-images
+            source: quay.io/openshift-release-dev/ocp-release
+            mirrorSourcePolicy: NeverContactSource
+          - mirrors:
+            - REGISTRY_PLACEHOLDER/openshift/release
+            source: quay.io/openshift-release-dev/ocp-v4.0-art-dev
+            mirrorSourcePolicy: NeverContactSource
+        IDMS_EOF
+        sed -i "s|REGISTRY_PLACEHOLDER|${REGISTRY}|g" /tmp/combined-idms.yaml
+        sed -i 's/^        //' /tmp/combined-idms.yaml
+
+        INSTALLER_DIR="$GITHUB_WORKSPACE/.ocp-tools/$OCP_VERSION"
+        mkdir -p "$INSTALLER_DIR"
+        echo "Extracting openshift-install from selected release payload via local registry mirrors..."
+        oc adm release extract "$RELEASE_IMAGE_BY_DIGEST" \
+          --command=openshift-install \
+          --command-os=linux/amd64 \
+          --to="$INSTALLER_DIR" \
+          --idms-file=/tmp/combined-idms.yaml
+        chmod +x "$INSTALLER_DIR/openshift-install"
+
+        INSTALLER_VERSION=$($INSTALLER_DIR/openshift-install version | awk 'NR==1 {print $2}')
+        if [ "$INSTALLER_VERSION" != "$OCP_VERSION" ]; then
+          echo "❌ Extracted openshift-install version mismatch: expected $OCP_VERSION, got $INSTALLER_VERSION"
+          $INSTALLER_DIR/openshift-install version || true
+          exit 1
+        fi
+        echo "✅ Extracted openshift-install matches metadata ocpVersion: $INSTALLER_VERSION"
+
         # Set release image override with DIGEST (not tag)
-        export OPENSHIFT_INSTALL_RELEASE_IMAGE_OVERRIDE="${REGISTRY}/openshift/release-images@${RELEASE_DIGEST}"
+        export OPENSHIFT_INSTALL_RELEASE_IMAGE_OVERRIDE="$RELEASE_IMAGE_BY_DIGEST"
         echo "Using release image: $OPENSHIFT_INSTALL_RELEASE_IMAGE_OVERRIDE"
 
         # Use workspace for temp files (container /tmp is on small root disk)
-        # NOTE: The oc wrapper approach was removed because it conflicts with openshift-install's
-        # internal --icsp-file flag ("icsp-file and idms-file are mutually exclusive" error).
-        # The DIGEST-based override + imageDigestSources in install-config.yaml is sufficient.
         export TMPDIR="$GITHUB_WORKSPACE/.tmp-iso"
         mkdir -p "$TMPDIR"
         echo "Using TMPDIR=$TMPDIR"
 
-        openshift-install agent create image --dir=. --log-level=debug
+        "$INSTALLER_DIR/openshift-install" agent create image --dir=. --log-level=debug
+        rm -f /tmp/combined-idms.yaml
 
         # Cleanup temp directory
         rm -rf "$TMPDIR"
@@ -599,135 +672,142 @@ jobs:
         INTERSIGHT_API_KEY_ID: ${{ secrets.INTERSIGHT_API_KEY_ID }}
         INTERSIGHT_SECRET_KEY: ${{ secrets.INTERSIGHT_SECRET_KEY }}
       run: |
-        # Get per-server vMedia policy MOID (isolated to prevent cross-contamination)
-        VMEDIA_POLICY_NAME="saif-${CLUSTER}-vmedia"
-        VMEDIA_MOID=$(isctl get vmedia policy --filter "Name eq '$VMEDIA_POLICY_NAME'" -o json | jq -r '.[0].Moid')
-
-        if [ -z "$VMEDIA_MOID" ] || [ "$VMEDIA_MOID" = "null" ]; then
-          echo "❌ vMedia policy '$VMEDIA_POLICY_NAME' not found"
-          exit 1
-        fi
-
-        echo "Updating vMedia policy $VMEDIA_POLICY_NAME ($VMEDIA_MOID) with ISO URL: $ISO_URL"
+        DATA_DIR="data/openshift/$CLUSTER"
+        NODE_COUNT=$(yq -r '.nodes | length' "$DATA_DIR/metadata.yaml")
 
         # Extract host, directory, and filename from ISO_URL
-        # ISO_URL format: http://10.0.0.10:8080/ai-pod-1/agent-ai-pod-1-20260114.iso
+        # ISO_URL format: http://10.0.0.10:8080/example-management/agent-example-management-20260510.iso
         ISO_HOST=$(echo "$ISO_URL" | sed 's|http://||' | cut -d'/' -f1)
         ISO_PATH=$(echo "$ISO_URL" | sed 's|http://[^/]*||')
         ISO_DIR=$(dirname "$ISO_PATH")
         ISO_FILE=$(basename "$ISO_PATH")
 
-        echo "vMedia mapping: HostName=$ISO_HOST, RemotePath=$ISO_DIR, RemoteFile=$ISO_FILE"
+        echo "Updating vMedia for $NODE_COUNT node(s), ISO: $ISO_FILE"
 
-        # Create mapping JSON with separate HostName, RemotePath, and RemoteFile
-        # Using FileLocation causes Intersight to strip the colon, breaking IP:PORT format
-        cat > /tmp/vmedia-mapping.json <<EOF
-        [{
-          "ClassId": "vmedia.Mapping",
-          "ObjectType": "vmedia.Mapping",
-          "VolumeName": "openshift-iso",
-          "DeviceType": "cdd",
-          "MountProtocol": "http",
-          "HostName": "$ISO_HOST",
-          "RemotePath": "$ISO_DIR",
-          "RemoteFile": "$ISO_FILE",
-          "AuthenticationProtocol": "none",
-          "Username": "${{ secrets.HTTP_SERVER_USER }}",
-          "Password": "${{ secrets.HTTP_SERVER_PASSWORD }}"
-        }]
+        for i in $(seq 0 $((NODE_COUNT - 1))); do
+          UCS_PROFILE=$(yq -r ".nodes[$i].ucsProfile" "$DATA_DIR/metadata.yaml")
+          VMEDIA_POLICY_NAME="${UCS_PROFILE}-vmedia"
+          VMEDIA_MOID=$(isctl get vmedia policy --filter "Name eq '$VMEDIA_POLICY_NAME'" -o json | jq -r '.[0].Moid')
+
+          if [ -z "$VMEDIA_MOID" ] || [ "$VMEDIA_MOID" = "null" ]; then
+            echo "❌ vMedia policy '$VMEDIA_POLICY_NAME' not found"
+            exit 1
+          fi
+
+          echo "Updating $VMEDIA_POLICY_NAME ($VMEDIA_MOID)..."
+          echo "  HostName=$ISO_HOST, RemotePath=$ISO_DIR, RemoteFile=$ISO_FILE"
+
+          cat > "$WORKDIR/vmedia-mapping.json" <<EOF
+          [{
+            "ClassId": "vmedia.Mapping",
+            "ObjectType": "vmedia.Mapping",
+            "VolumeName": "openshift-iso",
+            "DeviceType": "cdd",
+            "MountProtocol": "http",
+            "HostName": "$ISO_HOST",
+            "RemotePath": "$ISO_DIR",
+            "RemoteFile": "$ISO_FILE",
+            "AuthenticationProtocol": "none",
+            "Username": "${{ secrets.HTTP_SERVER_USER }}",
+            "Password": "${{ secrets.HTTP_SERVER_PASSWORD }}"
+          }]
         EOF
 
-        # Update vMedia policy
-        isctl update vmedia policy moid $VMEDIA_MOID --Mappings "$(cat /tmp/vmedia-mapping.json)"
-        echo "✅ vMedia policy updated with new ISO"
+          isctl update vmedia policy moid $VMEDIA_MOID --Mappings "$(cat "$WORKDIR/vmedia-mapping.json")"
+          echo "✅ $VMEDIA_POLICY_NAME updated"
+        done
 
     - name: Deploy Server Profile
+      shell: bash
       env:
         INTERSIGHT_API_KEY_ID: ${{ secrets.INTERSIGHT_API_KEY_ID }}
         INTERSIGHT_SECRET_KEY: ${{ secrets.INTERSIGHT_SECRET_KEY }}
       run: |
-        # Get serial number from cluster-mappings
-        SERIAL=$(yq -r ".clusters[] | select(.name == \"$CLUSTER\") | .serial" cluster-mappings.yaml)
+        trap 'echo "::error::Step cancelled"; exit 1' SIGTERM SIGINT
+        cancellable_sleep() { sleep "$1" & wait $!; }
 
-        if [ -z "$SERIAL" ]; then
-          echo "❌ Serial number not found for cluster $CLUSTER"
-          exit 1
-        fi
+        DATA_DIR="data/openshift/$CLUSTER"
+        NODE_COUNT=$(yq -r '.nodes | length' "$DATA_DIR/metadata.yaml")
 
-        echo "Finding server profile for serial $SERIAL..."
+        for i in $(seq 0 $((NODE_COUNT - 1))); do
+          UCS_PROFILE=$(yq -r ".nodes[$i].ucsProfile" "$DATA_DIR/metadata.yaml")
+          NODE_NAME=$(yq -r ".nodes[$i].name" "$DATA_DIR/metadata.yaml")
 
-        # Get server profile MOID via the assigned blade
-        SERVER_MOID=$(isctl get compute blade --filter "Serial eq '$SERIAL'" -o json | jq -r '.[0].Moid')
-        PROFILE_MOID=$(isctl get server profile --filter "AssignedServer.Moid eq '$SERVER_MOID'" -o json | jq -r '.[0].Moid')
-        PROFILE_NAME=$(isctl get server profile --filter "AssignedServer.Moid eq '$SERVER_MOID'" -o json | jq -r '.[0].Name')
+          echo "Deploying profile $UCS_PROFILE ($NODE_NAME)..."
 
-        if [ -z "$PROFILE_MOID" ] || [ "$PROFILE_MOID" = "null" ]; then
-          echo "❌ Server profile not found for server $SERIAL"
-          exit 1
-        fi
+          PROFILE_DATA=$(isctl get server profile --filter "Name eq '$UCS_PROFILE'" -o json 2>/dev/null)
+          PROFILE_MOID=$(echo "$PROFILE_DATA" | jq -r '.[0].Moid // empty')
 
-        echo "Deploying server profile $PROFILE_NAME ($PROFILE_MOID) to apply vMedia changes..."
-
-        # Pre-deploy guard: wait for profile to be in deployable state
-        # This prevents 403 errors if profile is in transitional state
-        echo "Checking profile state before deploy..."
-        WAIT_MAX=120
-        WAIT_ELAPSED=0
-        while [ $WAIT_ELAPSED -lt $WAIT_MAX ]; do
-          CURRENT_STATE=$(isctl get server profile moid $PROFILE_MOID -o json | jq -r '.ConfigContext.ConfigState // "unknown"')
-
-          # Deployable states - proceed with deploy
-          if [ "$CURRENT_STATE" = "Assigned" ] || [ "$CURRENT_STATE" = "Not-assigned" ] || [ "$CURRENT_STATE" = "Pending-changes" ]; then
-            echo "Profile ready for deploy (state: $CURRENT_STATE)"
-            break
-          fi
-
-          # Already deployed - skip deploy, vMedia change already applied
-          if [ "$CURRENT_STATE" = "Associated" ]; then
-            echo "Profile already Associated - vMedia policy update will take effect on next boot"
-            echo "✅ Server profile ready (no deploy needed)"
-            exit 0
-          fi
-
-          # Transitional states (Validating, Configuring, etc.) - wait
-          echo "Profile in $CURRENT_STATE state, waiting..."
-          sleep 5
-          WAIT_ELAPSED=$((WAIT_ELAPSED + 5))
-        done
-
-        if [ $WAIT_ELAPSED -ge $WAIT_MAX ]; then
-          echo "❌ Timeout waiting for profile to be ready for deploy"
-          exit 1
-        fi
-
-        # Send deploy action
-        isctl update server profile moid $PROFILE_MOID --Action Deploy
-
-        # Wait for profile to reach Associated state
-        echo "Waiting for profile deployment to complete..."
-        MAX_WAIT=600
-        ELAPSED=0
-        while [ $ELAPSED -lt $MAX_WAIT ]; do
-          STATE=$(isctl get server profile moid $PROFILE_MOID -o json | jq -r '.ConfigContext.ConfigState')
-          echo "  [$ELAPSED s] Profile state: $STATE"
-
-          if [ "$STATE" = "Associated" ]; then
-            echo "✅ Server profile deployed successfully"
-            break
-          fi
-
-          if [ "$STATE" = "Failed" ] || [ "$STATE" = "ConfigureFailed" ]; then
-            echo "❌ Profile deployment failed (state: $STATE)"
+          if [ -z "$PROFILE_MOID" ]; then
+            echo "❌ Server profile $UCS_PROFILE not found"
             exit 1
           fi
 
-          sleep 15
+          # Pre-deploy guard: wait for profile to be in deployable state
+          WAIT_MAX=120
+          WAIT_ELAPSED=0
+          while [ $WAIT_ELAPSED -lt $WAIT_MAX ]; do
+            CURRENT_STATE=$(isctl get server profile moid $PROFILE_MOID -o json | jq -r '.ConfigContext.ConfigState // "unknown"')
+
+            if [ "$CURRENT_STATE" = "Assigned" ] || [ "$CURRENT_STATE" = "Not-assigned" ] || [ "$CURRENT_STATE" = "Pending-changes" ]; then
+              echo "  Profile ready (state: $CURRENT_STATE)"
+              break
+            fi
+
+            if [ "$CURRENT_STATE" = "Associated" ]; then
+              echo "  Profile already Associated - vMedia update takes effect on next boot"
+              break
+            fi
+
+            echo "  Profile in $CURRENT_STATE state, waiting..."
+            cancellable_sleep 5
+            WAIT_ELAPSED=$((WAIT_ELAPSED + 5))
+          done
+
+          if [ $WAIT_ELAPSED -ge $WAIT_MAX ]; then
+            echo "❌ Timeout waiting for $UCS_PROFILE to be ready"
+            exit 1
+          fi
+
+          if [ "$CURRENT_STATE" != "Associated" ]; then
+            isctl update server profile moid $PROFILE_MOID --Action Deploy
+            echo "  Deploy action sent for $UCS_PROFILE"
+          fi
+        done
+
+        # Wait for all profiles to reach Associated state
+        echo "Waiting for all profile deployments to complete..."
+        MAX_WAIT=600
+        ELAPSED=0
+        while [ $ELAPSED -lt $MAX_WAIT ]; do
+          ALL_DONE=true
+          for i in $(seq 0 $((NODE_COUNT - 1))); do
+            UCS_PROFILE=$(yq -r ".nodes[$i].ucsProfile" "$DATA_DIR/metadata.yaml")
+            PROFILE_MOID=$(isctl get server profile --filter "Name eq '$UCS_PROFILE'" -o json | jq -r '.[0].Moid')
+            STATE=$(isctl get server profile moid $PROFILE_MOID -o json | jq -r '.ConfigContext.ConfigState')
+
+            if [ "$STATE" = "Failed" ] || [ "$STATE" = "ConfigureFailed" ]; then
+              echo "❌ $UCS_PROFILE deployment failed (state: $STATE)"
+              exit 1
+            fi
+
+            if [ "$STATE" != "Associated" ]; then
+              ALL_DONE=false
+            fi
+          done
+
+          if [ "$ALL_DONE" = "true" ]; then
+            echo "✅ All server profiles deployed successfully"
+            break
+          fi
+
+          echo "  [$ELAPSED s] Waiting for profiles..."
+          cancellable_sleep 15
           ELAPSED=$((ELAPSED + 15))
         done
 
         if [ $ELAPSED -ge $MAX_WAIT ]; then
-          echo "⚠️ Profile deployment taking longer than expected (state: $STATE)"
-          echo "Continuing anyway - boot may still work"
+          echo "⚠️ Profile deployment taking longer than expected, continuing anyway"
         fi
 
     - name: Boot Server from ISO
@@ -735,46 +815,126 @@ jobs:
         INTERSIGHT_API_KEY_ID: ${{ secrets.INTERSIGHT_API_KEY_ID }}
         INTERSIGHT_SECRET_KEY: ${{ secrets.INTERSIGHT_SECRET_KEY }}
       run: |
-        # Get serial number from cluster-mappings
-        SERIAL=$(yq -r ".clusters[] | select(.name == \"$CLUSTER\") | .serial" cluster-mappings.yaml)
-
-        if [ -z "$SERIAL" ]; then
-          echo "❌ Serial number not found for cluster $CLUSTER"
-          exit 1
-        fi
-
-        echo "Finding server with serial $SERIAL..."
-        SERVER_MOID=$(isctl get compute blade --filter "Serial eq '$SERIAL'" -o json | jq -r '.[0].Moid')
-
-        if [ -z "$SERVER_MOID" ] || [ "$SERVER_MOID" = "null" ]; then
-          echo "❌ Server not found with serial $SERIAL"
-          exit 1
-        fi
-
-        echo "Getting ServerSetting for blade $SERVER_MOID..."
-        SETTING_MOID=$(isctl get compute serversetting --filter "Server.Moid eq '$SERVER_MOID'" -o json | jq -r '.[0].Moid')
-
-        if [ -z "$SETTING_MOID" ] || [ "$SETTING_MOID" = "null" ]; then
-          echo "❌ ServerSetting not found for blade $SERVER_MOID"
-          exit 1
-        fi
-
-        # Get boot device name from boot policy (should be "CIMC-DVD")
-        # OneTimeBootDevice must use the NAME, not the subtype
+        DATA_DIR="data/openshift/$CLUSTER"
+        NODE_COUNT=$(yq -r '.nodes | length' "$DATA_DIR/metadata.yaml")
         BOOT_DEVICE="CIMC-DVD"
 
-        echo "Setting one-time boot to $BOOT_DEVICE and power cycling server $SERIAL..."
-        echo "Setting MOID: $SETTING_MOID"
+        for i in $(seq 0 $((NODE_COUNT - 1))); do
+          SERIAL=$(yq -r ".nodes[$i].serial" "$DATA_DIR/metadata.yaml")
+          NODE_NAME=$(yq -r ".nodes[$i].name" "$DATA_DIR/metadata.yaml")
 
-        # IMPORTANT: OneTimeBootDevice MUST be combined with PowerCycle in single command
-        # - Reboot only reboots the BMC (3 seconds), not the host
-        # - PowerCycle actually power cycles the host (~1.5 min)
-        isctl update compute serversetting moid "$SETTING_MOID" \
-          --OneTimeBootDevice "$BOOT_DEVICE" \
-          --AdminPowerState PowerCycle
+          echo "Booting $NODE_NAME (serial: $SERIAL) from vMedia ISO..."
 
-        echo "✅ Server power cycle initiated with one-time boot to vMedia"
-        echo "Server will power cycle and boot from OpenShift ISO"
+          SERVER_MOID=$(isctl get compute blade --filter "Serial eq '$SERIAL'" -o json | jq -r '.[0].Moid')
+          if [ -z "$SERVER_MOID" ] || [ "$SERVER_MOID" = "null" ]; then
+            echo "❌ Server not found with serial $SERIAL"
+            exit 1
+          fi
+
+          SETTING_MOID=$(isctl get compute serversetting --filter "Server.Moid eq '$SERVER_MOID'" -o json | jq -r '.[0].Moid')
+          if [ -z "$SETTING_MOID" ] || [ "$SETTING_MOID" = "null" ]; then
+            echo "❌ ServerSetting not found for $NODE_NAME"
+            exit 1
+          fi
+
+          isctl update compute serversetting moid "$SETTING_MOID" \
+            --OneTimeBootDevice "$BOOT_DEVICE" \
+            --AdminPowerState PowerCycle
+
+          echo "✅ $NODE_NAME: power cycle initiated with one-time boot to vMedia"
+        done
+
+        echo "All $NODE_COUNT server(s) booting from OpenShift ISO"
+
+    - name: Validate ABI Embedded Manifests
+      shell: bash
+      env:
+        SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      run: |
+        echo "## ABI Embedded Manifest Validation" >> $GITHUB_STEP_SUMMARY
+        DATA_DIR="data/openshift/$CLUSTER"
+        CLUSTER_IP=$(yq -r '.rendezvousIP' "$DATA_DIR/agent-config.yaml")
+        EMBEDDED_DIR="$WORKDIR/abi-embedded-manifests"
+        mkdir -p "$EMBEDDED_DIR"
+
+        if [ -z "$SSH_PRIVATE_KEY" ]; then
+          echo "❌ SSH_PRIVATE_KEY secret not configured; cannot collect ABI embedded manifests" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+        umask 077
+        SSH_KEY_FILE=$(mktemp "$RUNNER_TEMP/install-key.XXXXXX")
+        trap 'rm -f -- "$SSH_KEY_FILE"' EXIT
+        printf '%s\n' "$SSH_PRIVATE_KEY" > "$SSH_KEY_FILE"
+
+        echo "Waiting for rendezvous node SSH at $CLUSTER_IP..."
+        MAX_WAIT=900
+        ELAPSED=0
+        while [ $ELAPSED -lt $MAX_WAIT ]; do
+          if ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
+              core@$CLUSTER_IP "echo ready" >/dev/null 2>&1; then
+            echo "✅ Rendezvous node SSH is ready" >> $GITHUB_STEP_SUMMARY
+            break
+          fi
+          echo "  [${ELAPSED}s] Waiting for SSH..."
+          sleep 30
+          ELAPSED=$((ELAPSED + 30))
+        done
+
+        if [ $ELAPSED -ge $MAX_WAIT ]; then
+          echo "❌ Rendezvous node SSH did not become available within ${MAX_WAIT}s" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+        collect_file() {
+          local remote_path="$1"
+          local output_name="$2"
+          ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null core@$CLUSTER_IP \
+            "sudo test -s '$remote_path' && sudo cat '$remote_path'" > "$EMBEDDED_DIR/$output_name"
+        }
+
+        collect_first_existing() {
+          local output_name="$1"
+          shift
+          for remote_path in "$@"; do
+            if ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null core@$CLUSTER_IP \
+                "sudo test -s '$remote_path'" >/dev/null 2>&1; then
+              collect_file "$remote_path" "$output_name"
+              echo "  collected $remote_path -> $output_name"
+              return 0
+            fi
+          done
+          echo "missing:$output_name from candidates: $*" | tee -a "$EMBEDDED_DIR/collect-check.log"
+          return 1
+        }
+
+        collect_first_existing cluster-image-set.yaml /etc/assisted/manifests/cluster-image-set.yaml
+        collect_first_existing agent-cluster-install.yaml /etc/assisted/manifests/agent-cluster-install.yaml
+        collect_first_existing infraenv.yaml /etc/assisted/manifests/infraenv.yaml
+        collect_first_existing agent-config.yaml /etc/assisted/manifests/agent-config.yaml /etc/assisted/agent-config.yaml
+        collect_first_existing assisted-service.env /usr/local/share/assisted-service/assisted-service.env
+
+        ls -la "$EMBEDDED_DIR"
+
+        python3 scripts/validate-abi-embedded-manifests.py \
+          --cluster "$CLUSTER" \
+          --data-dir "$DATA_DIR" \
+          --embedded-dir "$EMBEDDED_DIR" \
+          --release-selection "$WORKDIR/release-selection.json" \
+          --output "$WORKDIR/abi-embedded-manifest-report.md"
+
+        cat "$WORKDIR/abi-embedded-manifest-report.md" >> $GITHUB_STEP_SUMMARY
+
+    - name: Upload ABI Embedded Manifest Artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: abi-embedded-manifests-${{ inputs.cluster_name }}
+        path: |
+          ${{ env.WORKDIR }}/abi-embedded-manifests/*.yaml
+          ${{ env.WORKDIR }}/abi-embedded-manifests/assisted-service.env
+          ${{ env.WORKDIR }}/abi-embedded-manifest-report.md
+          ${{ env.WORKDIR }}/release-selection.json
 
     - name: Wait for Cluster API Availability
       shell: bash
@@ -783,14 +943,19 @@ jobs:
         INTERSIGHT_SECRET_KEY: ${{ secrets.INTERSIGHT_SECRET_KEY }}
         FORCE_DEPLOY: ${{ inputs.force_deploy }}
       run: |
+        # Enable cancellation support - sleep & wait allows SIGTERM to interrupt
+        trap 'echo "::error::Step cancelled"; exit 1' SIGTERM SIGINT
+        cancellable_sleep() { sleep "$1" & wait $!; }
+
         echo "## Monitoring Installation Progress" >> $GITHUB_STEP_SUMMARY
 
-        BASE_DOMAIN=$(yq -r ".infrastructure.base_domain" cluster-mappings.yaml)
+        BASE_DOMAIN=$(yq -r '.baseDomain' "data/openshift/$CLUSTER/install-config.yaml")
         API_URL="https://api.$CLUSTER.$BASE_DOMAIN:6443"
-        SERIAL=$(yq -r ".clusters[] | select(.name == \"$CLUSTER\") | .serial" cluster-mappings.yaml)
+        # Monitor the rendezvous node (node 0) for power cycle status
+        SERIAL=$(yq -r '.nodes[0].serial' "data/openshift/$CLUSTER/metadata.yaml")
 
         # When force_deploy is true, we're redeploying an operational cluster.
-        # Use Intersight API to verify server has actually power cycled (deterministic).
+        # Use Intersight API to verify rendezvous server has actually power cycled.
         if [ "$FORCE_DEPLOY" = "true" ]; then
           echo "Force deploy mode: waiting for server power cycle via Intersight..."
           echo "### Waiting for Server Power Cycle" >> $GITHUB_STEP_SUMMARY
@@ -815,7 +980,7 @@ jobs:
                 break
               fi
               echo "  [${OFF_ELAPSED}s] Power state: $POWER_STATE, waiting for off..."
-              sleep 10
+              cancellable_sleep 10
               OFF_ELAPSED=$((OFF_ELAPSED + 10))
             done
 
@@ -838,7 +1003,7 @@ jobs:
                   break
                 fi
                 echo "  [${ON_ELAPSED}s] Power state: $POWER_STATE, waiting for on..."
-                sleep 10
+                cancellable_sleep 10
                 ON_ELAPSED=$((ON_ELAPSED + 10))
               done
             fi
@@ -851,7 +1016,7 @@ jobs:
         echo "The server will: boot ISO → install CoreOS → bootstrap cluster → start API"
         echo "### Waiting for New Cluster" >> $GITHUB_STEP_SUMMARY
 
-        CLUSTER_IP=$(yq -r ".clusters[] | select(.name == \"$CLUSTER\") | .ip" cluster-mappings.yaml)
+        CLUSTER_IP=$(yq -r '.rendezvousIP' "data/openshift/$CLUSTER/agent-config.yaml")
 
         # Clear any stale SSH host key from previous deployments
         # This prevents "REMOTE HOST IDENTIFICATION HAS CHANGED" errors after cluster redeploy
@@ -928,7 +1093,7 @@ jobs:
           PROGRESS_MSG="$PROGRESS_MSG | API: Waiting..."
 
           echo "$PROGRESS_MSG"
-          sleep $CHECK_INTERVAL
+          cancellable_sleep $CHECK_INTERVAL
           ELAPSED=$((ELAPSED + CHECK_INTERVAL))
         done
 
@@ -939,36 +1104,45 @@ jobs:
         fi
 
     - name: Wait for Installation Complete
+      shell: bash
+      env:
+        SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
       run: |
+        # Enable cancellation support
+        trap 'echo "::error::Step cancelled"; exit 1' SIGTERM SIGINT
+        cancellable_sleep() { sleep "$1" & wait $!; }
+
         echo "## Waiting for Installation to Complete" >> $GITHUB_STEP_SUMMARY
         echo "Cluster API is available, waiting for installation to finish..."
         echo "The cluster will: complete operator rollout → reconcile cluster version → mark Available=True"
 
-        CLUSTER_IP=$(yq -r ".clusters[] | select(.name == \"$CLUSTER\") | .ip" cluster-mappings.yaml)
+        CLUSTER_IP=$(yq -r '.rendezvousIP' "data/openshift/$CLUSTER/agent-config.yaml")
 
         # Wait for SSH to become available first
         echo "Waiting for SSH access to node..."
         MAX_SSH_WAIT=600  # 10 minutes
         SSH_ELAPSED=0
 
-        if [ -n "${{ secrets.SSH_PRIVATE_KEY }}" ]; then
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/ssh_key
-          chmod 600 /tmp/ssh_key
+        if [ -n "${SSH_PRIVATE_KEY:-}" ]; then
+          umask 077
+          SSH_KEY_FILE=$(mktemp "$RUNNER_TEMP/install-wait-key.XXXXXX")
+          trap 'rm -f -- "$SSH_KEY_FILE"' EXIT
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$SSH_KEY_FILE"
 
           while [ $SSH_ELAPSED -lt $MAX_SSH_WAIT ]; do
-            if ssh -i /tmp/ssh_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
+            if ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 \
                 core@$CLUSTER_IP "echo SSH connected" >/dev/null 2>&1; then
               echo "✅ SSH access established"
               break
             fi
             echo "Waiting for SSH... ($SSH_ELAPSED seconds)"
-            sleep 30
+            cancellable_sleep 30
             SSH_ELAPSED=$((SSH_ELAPSED + 30))
           done
 
           if [ $SSH_ELAPSED -ge $MAX_SSH_WAIT ]; then
             echo "❌ SSH access not available within timeout"
-            rm -f /tmp/ssh_key
+            rm -f "$SSH_KEY_FILE"
             exit 1
           fi
 
@@ -976,7 +1150,8 @@ jobs:
           echo "Monitoring cluster installation progress..."
           MAX_WAIT=5400  # 90 minutes for full installation
           ELAPSED=0
-          RECOVERY_KUBECONFIG="/etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/localhost-recovery.kubeconfig"
+          KUBECONFIG_CANDIDATES="/opt/openshift/auth/kubeconfig /var/opt/openshift/auth/kubeconfig /etc/kubernetes/static-pod-resources/kube-apiserver-certs/secrets/node-kubeconfigs/localhost-recovery.kubeconfig /etc/kubernetes/kubeconfig"
+          SELECTED_KUBECONFIG=""
 
           # Track milestones
           BOOTSTRAP_SEEN=false
@@ -984,9 +1159,24 @@ jobs:
           ETCD_SEEN=false
 
           while [ $ELAPSED -lt $MAX_WAIT ]; do
+            PROGRESS_MSG="[${ELAPSED}s]"
+
+            # The API can answer /version before the final recovery kubeconfig exists.
+            # Select the first present kubeconfig that can actually talk to the local API.
+            SELECTED_KUBECONFIG=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null core@$CLUSTER_IP \
+              "for p in $KUBECONFIG_CANDIDATES; do if sudo test -s \"\$p\" && sudo KUBECONFIG=\"\$p\" oc get --raw=/version >/dev/null 2>&1; then echo \"\$p\"; exit 0; fi; done" 2>/dev/null || true)
+
+            if [ -z "$SELECTED_KUBECONFIG" ]; then
+              PROGRESS_MSG="$PROGRESS_MSG Kubeconfig: Pending"
+              echo "$PROGRESS_MSG"
+              cancellable_sleep 30
+              ELAPSED=$((ELAPSED + 30))
+              continue
+            fi
+
             # Check ClusterVersion Available status
-            AVAILABLE=$(ssh -i /tmp/ssh_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null core@$CLUSTER_IP \
-              "sudo KUBECONFIG=$RECOVERY_KUBECONFIG oc get clusterversion -o jsonpath='{.items[0].status.conditions[?(@.type==\"Available\")].status}' 2>/dev/null" || echo "")
+            AVAILABLE=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null core@$CLUSTER_IP \
+              "sudo KUBECONFIG=$SELECTED_KUBECONFIG oc get clusterversion -o jsonpath='{.items[0].status.conditions[?(@.type==\"Available\")].status}' 2>/dev/null || true" 2>/dev/null || true)
 
             if [ "$AVAILABLE" = "True" ]; then
               echo "✅ Cluster installation complete (ClusterVersion Available=True)"
@@ -995,11 +1185,8 @@ jobs:
             fi
 
             # Detailed progress checks (every 30 seconds)
-            PROGRESS_MSG="[${ELAPSED}s]"
-
-            # Check node status
-            NODE_STATUS=$(ssh -i /tmp/ssh_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null core@$CLUSTER_IP \
-              "sudo KUBECONFIG=$RECOVERY_KUBECONFIG oc get nodes --no-headers 2>/dev/null | awk '{print \$2}'" || echo "")
+            NODE_STATUS=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null core@$CLUSTER_IP \
+              "sudo KUBECONFIG=$SELECTED_KUBECONFIG oc get nodes --no-headers 2>/dev/null | awk '{print \$2}' || true" 2>/dev/null || true)
             if [ -n "$NODE_STATUS" ]; then
               PROGRESS_MSG="$PROGRESS_MSG Node: $NODE_STATUS"
             else
@@ -1007,35 +1194,35 @@ jobs:
             fi
 
             # Check cluster operators count (strip whitespace to avoid shell comparison issues)
-            OPERATOR_COUNT=$(ssh -i /tmp/ssh_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null core@$CLUSTER_IP \
-              "sudo KUBECONFIG=$RECOVERY_KUBECONFIG oc get co --no-headers 2>/dev/null | wc -l" 2>/dev/null | tr -d '[:space:]')
+            OPERATOR_COUNT=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null core@$CLUSTER_IP \
+              "sudo KUBECONFIG=$SELECTED_KUBECONFIG oc get co --no-headers 2>/dev/null | wc -l || true" 2>/dev/null | tr -d '[:space:]' || true)
             OPERATOR_COUNT="${OPERATOR_COUNT:-0}"
-            AVAILABLE_OPS=$(ssh -i /tmp/ssh_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null core@$CLUSTER_IP \
-              "sudo KUBECONFIG=$RECOVERY_KUBECONFIG oc get co --no-headers 2>/dev/null | grep -c 'True.*False.*False'" 2>/dev/null | tr -d '[:space:]')
+            AVAILABLE_OPS=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null core@$CLUSTER_IP \
+              "sudo KUBECONFIG=$SELECTED_KUBECONFIG oc get co --no-headers 2>/dev/null | grep -c 'True.*False.*False' || true" 2>/dev/null | tr -d '[:space:]' || true)
             AVAILABLE_OPS="${AVAILABLE_OPS:-0}"
 
             if [ "$OPERATOR_COUNT" -gt 0 ]; then
               PROGRESS_MSG="$PROGRESS_MSG | Operators: ${AVAILABLE_OPS}/${OPERATOR_COUNT}"
               if [ "$OPERATORS_SEEN" = "false" ]; then
-                echo "  📊 Cluster operators detected (${AVAILABLE_OPS}/${OPERATOR_COUNT} available)"
+                echo "  Cluster operators detected (${AVAILABLE_OPS}/${OPERATOR_COUNT} available)"
                 OPERATORS_SEEN=true
               fi
             fi
 
             # Check etcd status (strip whitespace to avoid shell comparison issues)
-            ETCD_PODS=$(ssh -i /tmp/ssh_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null core@$CLUSTER_IP \
-              "sudo KUBECONFIG=$RECOVERY_KUBECONFIG oc get pods -n openshift-etcd -l app=etcd --no-headers 2>/dev/null | grep -c Running" 2>/dev/null | tr -d '[:space:]')
+            ETCD_PODS=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null core@$CLUSTER_IP \
+              "sudo KUBECONFIG=$SELECTED_KUBECONFIG oc get pods -n openshift-etcd -l app=etcd --no-headers 2>/dev/null | grep -c Running || true" 2>/dev/null | tr -d '[:space:]' || true)
             ETCD_PODS="${ETCD_PODS:-0}"
             if [ "$ETCD_PODS" -gt 0 ] && [ "$ETCD_SEEN" = "false" ]; then
-              echo "  🔐 etcd pods running"
+              echo "  etcd pods running"
               ETCD_SEEN=true
             fi
 
             # Check ClusterVersion progress
-            VERSION=$(ssh -i /tmp/ssh_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null core@$CLUSTER_IP \
-              "sudo KUBECONFIG=$RECOVERY_KUBECONFIG oc get clusterversion -o jsonpath='{.items[0].status.desired.version}' 2>/dev/null" || echo "")
-            PROGRESSING=$(ssh -i /tmp/ssh_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null core@$CLUSTER_IP \
-              "sudo KUBECONFIG=$RECOVERY_KUBECONFIG oc get clusterversion -o jsonpath='{.items[0].status.conditions[?(@.type==\"Progressing\")].status}' 2>/dev/null" || echo "")
+            VERSION=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null core@$CLUSTER_IP \
+              "sudo KUBECONFIG=$SELECTED_KUBECONFIG oc get clusterversion -o jsonpath='{.items[0].status.desired.version}' 2>/dev/null || true" 2>/dev/null || true)
+            PROGRESSING=$(ssh -i "$SSH_KEY_FILE" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null core@$CLUSTER_IP \
+              "sudo KUBECONFIG=$SELECTED_KUBECONFIG oc get clusterversion -o jsonpath='{.items[0].status.conditions[?(@.type==\"Progressing\")].status}' 2>/dev/null || true" 2>/dev/null || true)
 
             if [ -n "$VERSION" ]; then
               PROGRESS_MSG="$PROGRESS_MSG | Version: $VERSION"
@@ -1048,11 +1235,11 @@ jobs:
 
             echo "$PROGRESS_MSG"
 
-            sleep 30
+            cancellable_sleep 30
             ELAPSED=$((ELAPSED + 30))
           done
 
-          rm -f /tmp/ssh_key
+          rm -f "$SSH_KEY_FILE"
 
           if [ $ELAPSED -ge $MAX_WAIT ]; then
             echo "❌ Timeout waiting for cluster installation to complete" >> $GITHUB_STEP_SUMMARY
@@ -1062,7 +1249,7 @@ jobs:
         else
           echo "⚠️  SSH_PRIVATE_KEY secret not configured - cannot check installation status"
           echo "Sleeping 20 minutes to allow installation to complete..."
-          sleep 1200
+          cancellable_sleep 1200
         fi
 
     - name: Summary
@@ -1081,12 +1268,22 @@ jobs:
         echo "- Apply IDMS mirror configuration" >> $GITHUB_STEP_SUMMARY
         echo "- Bootstrap ArgoCD GitOps" >> $GITHUB_STEP_SUMMARY
 
+    - name: Clean workflow-owned installation material
+      if: always()
+      run: |
+        if [ -n "${WORKDIR:-}" ]; then
+          case "$WORKDIR" in
+            "$RUNNER_TEMP"/openshift-install.*) rm -rf "$WORKDIR" ;;
+            *) echo 'Refusing cleanup of an unowned path' >&2; exit 1 ;;
+          esac
+        fi
+
   dry-run:
     name: 'Validate Configuration (Dry Run)'
-    runs-on: [self-hosted, linux, saif-github-runner]
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     container:
-      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
-    if: inputs.action == 'DRY-RUN'
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
+    if: inputs.action != 'DEPLOY'
 
     env:
       CLUSTER: ${{ inputs.cluster_name }}
@@ -1096,20 +1293,26 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Validate Rendered Configs
+      env:
+        REQUESTED_ACTION: ${{ inputs.action }}
       run: |
+        if [ "$REQUESTED_ACTION" != DRY-RUN ]; then
+          echo 'Unsupported install action; use openshift-undeploy.yaml for undeploy.' >&2
+          exit 1
+        fi
         echo "## Dry Run - Configuration Validation" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "**Cluster:** $CLUSTER" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
 
-        if [ -f "data/$CLUSTER/install-config.yaml" ]; then
+        if [ -f "data/openshift/$CLUSTER/install-config.yaml" ]; then
           echo "✅ install-config.yaml exists" >> $GITHUB_STEP_SUMMARY
         else
           echo "❌ install-config.yaml NOT found" >> $GITHUB_STEP_SUMMARY
           exit 1
         fi
 
-        if [ -f "data/$CLUSTER/agent-config.yaml" ]; then
+        if [ -f "data/openshift/$CLUSTER/agent-config.yaml" ]; then
           echo "✅ agent-config.yaml exists" >> $GITHUB_STEP_SUMMARY
         else
           echo "❌ agent-config.yaml NOT found" >> $GITHUB_STEP_SUMMARY

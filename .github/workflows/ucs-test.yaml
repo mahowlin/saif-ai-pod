@@ -19,14 +19,13 @@ name: 'Test UCS Deployment'
 # - Server profile is associated
 # - Profile ConfigState is "Ok"
 # - MAC address assigned
-# - cluster-macs.yaml generated and committed
-# - MAC address in cluster-macs.yaml matches Intersight
+# - MAC addresses assigned in live Intersight vNICs
 
 on:
   workflow_dispatch:
     inputs:
       cluster_name:
-        description: 'Cluster name (ai-pod-1, ai-pod-2, etc.)'
+        description: 'Cluster name (example-node-1, example-node-2, etc.)'
         required: true
         type: string
   workflow_call:
@@ -36,83 +35,61 @@ on:
         required: true
 
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   test:
     name: 'Test UCS Deployment'
-    runs-on: [self-hosted, linux, saif-github-runner]
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     container:
-      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
 
     steps:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Test cluster-macs.yaml Generation
+    - name: Test Live MAC Address Assignment
+      env:
+        INTERSIGHT_API_KEY_ID: ${{ secrets.INTERSIGHT_API_KEY_ID }}
+        INTERSIGHT_SECRET_KEY: ${{ secrets.INTERSIGHT_SECRET_KEY }}
       run: |
-        echo "## cluster-macs.yaml Validation" >> $GITHUB_STEP_SUMMARY
+        echo "## Live MAC Address Validation" >> $GITHUB_STEP_SUMMARY
         VALIDATION_FAILED=0
         CLUSTER="${{ inputs.cluster_name }}"
+        PROFILE="saif-${CLUSTER}"
 
-        # Check cluster-macs.yaml exists
-        if [ ! -f "openshift/cluster-macs.yaml" ]; then
-          echo "❌ openshift/cluster-macs.yaml not found" >> $GITHUB_STEP_SUMMARY
-          echo "   Run: gh workflow run ucs/deploy.yaml -f action=DEPLOY" >> $GITHUB_STEP_SUMMARY
-          VALIDATION_FAILED=1
-          exit 1
-        else
-          echo "✅ openshift/cluster-macs.yaml exists" >> $GITHUB_STEP_SUMMARY
-        fi
-
-        # Get serial number for this cluster
-        if [ ! -f "openshift/cluster-mappings.yaml" ]; then
-          echo "❌ openshift/cluster-mappings.yaml not found" >> $GITHUB_STEP_SUMMARY
-          VALIDATION_FAILED=1
+        PROFILE_DATA=$(isctl get server profile --filter "Name eq '$PROFILE'" -o json)
+        PROFILE_MOID=$(echo "$PROFILE_DATA" | jq -r '.[0].Moid // empty')
+        if [ -z "$PROFILE_MOID" ]; then
+          echo "❌ Server profile not found: $PROFILE" >> $GITHUB_STEP_SUMMARY
           exit 1
         fi
 
-        SERIAL=$(yq ".clusters[] | select(.name == \"$CLUSTER\") | .serial" openshift/cluster-mappings.yaml)
-        if [ -z "$SERIAL" ]; then
-          echo "❌ Serial number not found for cluster $CLUSTER" >> $GITHUB_STEP_SUMMARY
-          VALIDATION_FAILED=1
-          exit 1
-        fi
-
-        echo "✅ Cluster serial: $SERIAL" >> $GITHUB_STEP_SUMMARY
-
-        # Check MAC address in cluster-macs.yaml
-        if yq ".servers.$SERIAL" openshift/cluster-macs.yaml | grep -q "mac_address"; then
-          MAC=$(yq ".servers.$SERIAL.mac_address" openshift/cluster-macs.yaml)
-          PROFILE=$(yq ".servers.$SERIAL.profile" openshift/cluster-macs.yaml)
-
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**MAC Address Found:**" >> $GITHUB_STEP_SUMMARY
-          echo "- Serial: $SERIAL" >> $GITHUB_STEP_SUMMARY
-          echo "- Profile: $PROFILE" >> $GITHUB_STEP_SUMMARY
-          echo "- MAC: $MAC" >> $GITHUB_STEP_SUMMARY
-
-          # Validate MAC is not empty
-          if [ -z "$MAC" ] || [ "$MAC" == "null" ]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "❌ MAC address is empty or null" >> $GITHUB_STEP_SUMMARY
+        for IFACE in eth0 eth1; do
+          MAC=$(isctl get vnic ethif --filter "Profile.Moid eq '$PROFILE_MOID' and Name eq '$IFACE'" -o json | jq -r '.[0].MacAddress // ""')
+          if [ -z "$MAC" ]; then
+            echo "❌ $PROFILE $IFACE MAC not assigned" >> $GITHUB_STEP_SUMMARY
             VALIDATION_FAILED=1
           else
-            echo "✅ MAC address assigned: $MAC" >> $GITHUB_STEP_SUMMARY
+            echo "✅ $PROFILE $IFACE: $MAC" >> $GITHUB_STEP_SUMMARY
           fi
-        else
-          echo "❌ MAC address not found for serial $SERIAL" >> $GITHUB_STEP_SUMMARY
-          echo "   Available servers: $(yq '.servers | keys' openshift/cluster-macs.yaml)" >> $GITHUB_STEP_SUMMARY
-          VALIDATION_FAILED=1
-        fi
+        done
 
         if [ $VALIDATION_FAILED -eq 1 ]; then
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**❌ cluster-macs.yaml validation FAILED**" >> $GITHUB_STEP_SUMMARY
+          echo "**❌ Live MAC address validation FAILED**" >> $GITHUB_STEP_SUMMARY
           exit 1
         fi
 
     - name: Test Summary
       if: always()
       run: |
+        if [ "${{ job.status }}" != success ]; then
+          echo "Validation failed or was cancelled; inspect prior steps." >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+        fi
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "---" >> $GITHUB_STEP_SUMMARY
         echo "**✅ UCS deployment test passed**" >> $GITHUB_STEP_SUMMARY

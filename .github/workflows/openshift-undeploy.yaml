@@ -36,20 +36,15 @@ on:
   workflow_dispatch:
     inputs:
       cluster_name:
-        description: 'Cluster to undeploy'
+        description: 'Cluster to undeploy (e.g. example-node-1, example-management)'
         required: true
-        type: choice
-        options:
-          - ai-pod-1
-          - ai-pod-2
-          - ai-pod-3
-          - ai-pod-4
+        type: string
       confirm_destroy:
         description: 'Type cluster name to confirm destruction'
         required: true
         type: string
       clean_kubeconfig:
-        description: 'Remove kubeconfig from kubeconfig storage repo'
+        description: 'Remove kubeconfig from saif-kubeconfigs'
         type: boolean
         default: true
       dry_run:
@@ -63,16 +58,17 @@ on:
         type: string
         default: ''
 
+
 defaults:
   run:
-    working-directory: openshift
+    shell: bash
 
 jobs:
   undeploy:
     name: 'Undeploy ${{ inputs.cluster_name }}'
-    runs-on: [self-hosted, linux, saif-github-runner]
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
     container:
-      image: ghcr.io/mahowlin/github-actions-container:${{ vars.CONTAINER_TAG }}
+      image: ${{ vars.RUNNER_CONTAINER_IMAGE }}
 
     env:
       CLUSTER: ${{ inputs.cluster_name }}
@@ -93,13 +89,13 @@ jobs:
 
         echo "**Confirmed:** Cluster name matches" >> $GITHUB_STEP_SUMMARY
 
-    - name: Safety Check for ai-pod-1
-      if: inputs.cluster_name == 'ai-pod-1'
+    - name: Safety Check for example-node-1
+      if: inputs.cluster_name == 'example-node-1'
       run: |
-        echo "::warning::ai-pod-1 is the production GPU cluster. Extra confirmation required."
+        echo "::warning::example-node-1 is the production GPU cluster. Extra confirmation required."
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "### Production Cluster Warning" >> $GITHUB_STEP_SUMMARY
-        echo "ai-pod-1 is typically used for production workloads and GPU demos." >> $GITHUB_STEP_SUMMARY
+        echo "example-node-1 is typically used for production workloads and GPU demos." >> $GITHUB_STEP_SUMMARY
         echo "Proceeding with undeploy as confirmation was provided." >> $GITHUB_STEP_SUMMARY
 
     - name: Checkout
@@ -111,11 +107,12 @@ jobs:
         echo "## Cluster Information" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
 
-        # Get cluster details from cluster-mappings
-        SERIAL=$(yq -r ".clusters[] | select(.name == \"$CLUSTER\") | .serial" cluster-mappings.yaml)
-        PROFILE_NAME=$(yq -r ".clusters[] | select(.name == \"$CLUSTER\") | .ucs_profile" cluster-mappings.yaml)
-        CLUSTER_IP=$(yq -r ".clusters[] | select(.name == \"$CLUSTER\") | .ip" cluster-mappings.yaml)
-        BASE_DOMAIN=$(yq -r ".infrastructure.base_domain" cluster-mappings.yaml)
+        # Get cluster details from SAIF-generated artifacts
+        DATA_DIR="data/openshift/${CLUSTER}"
+        SERIAL=$(yq -r '.nodes[0].serial' "$DATA_DIR/metadata.yaml")
+        PROFILE_NAME=$(yq -r '.nodes[0].ucsProfile' "$DATA_DIR/metadata.yaml")
+        CLUSTER_IP=$(yq -r '.rendezvousIP' "$DATA_DIR/agent-config.yaml")
+        BASE_DOMAIN=$(yq -r '.baseDomain' "$DATA_DIR/install-config.yaml")
 
         if [ -z "$SERIAL" ] || [ "$SERIAL" = "null" ]; then
           echo "::error::Serial number not found for cluster $CLUSTER"
@@ -161,7 +158,7 @@ jobs:
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "## Dry Run - Actions That Would Be Taken" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
-        echo "1. **Remove kubeconfig:** \`clusters/$CLUSTER/kubeconfig\` from kubeconfig storage repo" >> $GITHUB_STEP_SUMMARY
+        echo "1. **Remove kubeconfig:** \`clusters/$CLUSTER/kubeconfig\` from the configured KUBECONFIG_REPOSITORY" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "**Note:** UCS server profile is NOT modified. The server stays assigned." >> $GITHUB_STEP_SUMMARY
         echo "To redeploy, simply run \`openshift-deploy.yaml\` workflow." >> $GITHUB_STEP_SUMMARY
@@ -170,17 +167,28 @@ jobs:
       if: ${{ !inputs.dry_run && inputs.clean_kubeconfig }}
       env:
         GH_TOKEN: ${{ secrets.KUBECONFIG_REPO_TOKEN }}
+        KUBECONFIG_REPOSITORY: ${{ vars.KUBECONFIG_REPOSITORY }}
+        KUBECONFIG_REF: ${{ vars.KUBECONFIG_REF || 'main' }}
       run: |
+        set -euo pipefail
+        [[ "$KUBECONFIG_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+        [[ "$CLUSTER" =~ ^[A-Za-z0-9_.-]+$ ]]
+        test -n "$GH_TOKEN"
+        umask 077
+        PRIVATE_DIR=$(mktemp -d "$RUNNER_TEMP/kubeconfig-removal.XXXXXX")
+        trap 'rm -rf "$PRIVATE_DIR"' EXIT
         echo "## Kubeconfig Removal" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
 
         # Clone private repo
-        git clone --depth 1 \
-          # Configure this URL for your kubeconfig storage repository
-          "https://x-access-token:${GH_TOKEN}@github.com/mahowlin/saif-kubeconfigs.git" \
-          /tmp/kubeconfigs
+        export GIT_CONFIG_COUNT=1
+        export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+        export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
+        git clone --depth 1 --branch "$KUBECONFIG_REF" \
+          "https://github.com/$KUBECONFIG_REPOSITORY.git" \
+          "$PRIVATE_DIR/repo"
 
-        cd /tmp/kubeconfigs
+        cd "$PRIVATE_DIR/repo"
 
         if [ -d "clusters/$CLUSTER" ]; then
           rm -rf "clusters/$CLUSTER"
@@ -195,7 +203,7 @@ jobs:
             git commit -m "Remove kubeconfig for $CLUSTER (undeployed)"
             for attempt in 1 2 3; do
               git rebase --abort 2>/dev/null || true
-              if git pull --rebase origin main && git push; then break; fi
+              if git pull --rebase origin "$KUBECONFIG_REF" && git push; then break; fi
               if [ $attempt -eq 3 ]; then echo "::error::Push failed after 3 attempts"; exit 1; fi
               echo "Push race (attempt $attempt/3), retrying..."
               sleep $((attempt * 2))
@@ -206,7 +214,7 @@ jobs:
           echo "No kubeconfig found for $CLUSTER (directory does not exist)" >> $GITHUB_STEP_SUMMARY
         fi
 
-        rm -rf /tmp/kubeconfigs
+        rm -rf "$PRIVATE_DIR/repo"
 
     - name: Summary
       run: |

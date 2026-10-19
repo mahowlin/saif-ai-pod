@@ -1,0 +1,88 @@
+#------------------------------------------------------------------------------
+# OpenShift Install Configuration — Compact 3-Node (Day 1 Cilium)
+#------------------------------------------------------------------------------
+# Generated from template by render-cluster-config.py --mode compact-day1
+# Cluster: {{ cluster.name }}
+#------------------------------------------------------------------------------
+# Key differences from SNO:
+#   - controlPlane.replicas: 3 (not 1)
+#   - compute.replicas: 0 (controllers double as workers)
+#   - platform: baremetal with apiVIPs + ingressVIPs (not platform: none)
+#   - networkType: OVNKubernetes (Day 1 Cilium replaces it via manifests)
+#------------------------------------------------------------------------------
+
+apiVersion: v1
+metadata:
+  name: {{ cluster.name }}
+baseDomain: {{ infrastructure.base_domain }}
+
+#------------------------------------------------------------------------------
+# Compute Configuration — no dedicated workers (compact mode)
+#------------------------------------------------------------------------------
+compute:
+  - name: worker
+    replicas: 0
+
+#------------------------------------------------------------------------------
+# Control Plane Configuration — 3 controllers doubling as workers
+#------------------------------------------------------------------------------
+controlPlane:
+  name: master
+  replicas: 3
+  platform: {}
+
+#------------------------------------------------------------------------------
+# Networking Configuration — Cilium replaces OVN via Day 1 manifests
+#------------------------------------------------------------------------------
+networking:
+  networkType: OVNKubernetes
+
+  clusterNetwork:
+    - cidr: {{ infrastructure.cluster_network.cidr }}
+      hostPrefix: {{ infrastructure.cluster_network.host_prefix }}
+
+  serviceNetwork:
+{% for network in infrastructure.service_network %}
+    - {{ network }}
+{% endfor %}
+
+  machineNetwork:
+    - cidr: {{ infrastructure.network_cidr }}
+
+#------------------------------------------------------------------------------
+# Platform Configuration — baremetal enables keepalived + haproxy for HA VIPs
+#------------------------------------------------------------------------------
+platform:
+  baremetal:
+    apiVIPs:
+      - {{ cluster.api_vip }}
+    ingressVIPs:
+      - {{ cluster.ingress_vip }}
+
+#------------------------------------------------------------------------------
+# Image Digest Sources — Air-Gap Mirror Configuration
+#------------------------------------------------------------------------------
+imageDigestSources:
+{% for ics in infrastructure.image_content_sources %}
+  - mirrors:
+{% for mirror in ics.mirrors %}
+      - {{ mirror }}
+{% endfor %}
+    source: {{ ics.source }}
+{% endfor %}
+
+#------------------------------------------------------------------------------
+# Credentials
+#------------------------------------------------------------------------------
+pullSecret: '{{ pull_secret | default("PLACEHOLDER") }}'
+sshKey: '{{ ssh_key | default("PLACEHOLDER") }}'
+
+#------------------------------------------------------------------------------
+# Additional Trust Bundle (registry TLS)
+#------------------------------------------------------------------------------
+{% if additional_trust_bundle %}
+additionalTrustBundlePolicy: Always
+
+additionalTrustBundle: |
+{{ additional_trust_bundle | indent(2, first=True) }}
+{% endif %}
